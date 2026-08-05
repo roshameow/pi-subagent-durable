@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# logs & temp
+*.log
+.DS_Store
+
+# pi install artifacts
+.npm/

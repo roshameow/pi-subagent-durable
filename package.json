@@ -1,0 +1,38 @@
+{
+  "name": "pi-subagent-durable",
+  "version": "0.1.0",
+  "description": "Durable background subagents for pi: RMUX persistent panes, full session persistence with kill/resume, LLM-manageable (list/reload/stop), context usage stats, slim event logs.",
+  "keywords": [
+    "pi-package",
+    "subagent",
+    "multi-agent",
+    "background-agents",
+    "rmux",
+    "session-resume"
+  ],
+  "type": "commonjs",
+  "main": "extensions/index.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourname/pi-subagent-durable.git"
+  },
+  "scripts": {
+    "check": "npx esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --external:@rmux/* --external:typebox --outfile=/tmp/pi-subagent-durable-check.js"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "@rmux/sdk": "^0.6.5"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
