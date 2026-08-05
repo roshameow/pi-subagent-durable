@@ -11,3 +11,4 @@ dist/
 
 # pi install artifacts
 .npm/
+docs/
