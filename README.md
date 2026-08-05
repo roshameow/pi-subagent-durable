@@ -118,3 +118,5 @@ pi (main session)
 ## Development
 
 Full internal/technical documentation (architecture, log format, filter details, known issues & fix history, debugging) lives in [`docs/INTERNAL.md`](docs/INTERNAL.md).
+
+Publishing evaluation (difficulty assessment for going from git package to npm) lives in [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
