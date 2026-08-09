@@ -1791,7 +1791,7 @@ Return a concise summary of what you did and the key findings.`,
 								const usageLine = u && u.turns > 0
 									? (u.contextWindow ? ` [ctx ${((u.contextTokens / u.contextWindow) * 100).toFixed(1)}%/${fmtCompact(u.contextWindow)}]` : ` [ctx ${fmtCompact(u.contextTokens)}]`)
 									: "";
-								pi.sendUserMessage(`Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`);
+								pi.sendUserMessage(`Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`, { deliverAs: "steer" });
 							} catch {}
 						}
 					};
@@ -1909,7 +1909,7 @@ Return a concise summary of what you did and the key findings.`,
 					const usageLine = u && u.turns > 0
 						? (u.contextWindow ? ` [ctx ${((u.contextTokens / u.contextWindow) * 100).toFixed(1)}%/${fmtCompact(u.contextWindow)}]` : ` [ctx ${fmtCompact(u.contextTokens)}]`)
 						: "";
-					pi.sendUserMessage(`Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`);
+					pi.sendUserMessage(`Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`, { deliverAs: "steer" });
 				} catch {}
 			}
 		});
@@ -2259,7 +2259,7 @@ Return a concise summary of what you did and the key findings.`,
 				pi.registerCommand(`agent:${agentName}`, {
 					description: frontmatter.description,
 					handler: async (args, cmdCtx) => {
-						await cmdCtx.ui.sendUserMessage(`用 ${agentName} ${args.trim() || "请执行任务"}`);
+						await cmdCtx.ui.sendUserMessage(`用 ${agentName} ${args.trim() || "请执行任务"}`, { deliverAs: "steer" });
 					},
 				});
 			}
