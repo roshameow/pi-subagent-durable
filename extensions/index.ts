@@ -931,12 +931,16 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 			const m = /^([\w-]+)-task-/.exec(winName);
 			if (m) agent = m[1];
 		}
-		// task 文本:首条 user 消息
+		// task 文本:首条 user 消息(日志里是 message_start/message_end 事件)
 		let task = "";
 		try {
-			for (const l of lines.slice(1, 25)) {
+			for (const l of lines.slice(1, 30)) {
 				const ev = JSON.parse(l);
-				if (ev.type === "message" && ev.message?.role === "user" && Array.isArray(ev.message.content)) {
+				if (
+					(ev.type === "message_start" || ev.type === "message_end") &&
+					ev.message?.role === "user" &&
+					Array.isArray(ev.message.content)
+				) {
 					task = typeof ev.message.content[0]?.text === "string" ? ev.message.content[0].text : "";
 					if (task) break;
 				}
