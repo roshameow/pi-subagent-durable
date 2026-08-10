@@ -94,6 +94,25 @@ function makeRmuxWindowName(agentName: string, taskId: string): string {
 	return `${safe}-${taskId}`.slice(0, 60);
 }
 
+// 从 NDJSON 事件流提取最后一条「非空」的 assistant 文本消息。
+// 之前只取最后一条 message_end 的文本：若最后一条是纯 toolCall/空消息（常见），
+// 真实总结会被丢弃，且 finalText 为空导致完成通知被跳过（主 agent 收不到通知）。
+function extractAssistantFinalText(raw: string): string {
+	let last = "";
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const event = JSON.parse(line);
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				const parts = event.message.content || [];
+				const text = parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n").trim();
+				if (text) last = text;
+			}
+		} catch {}
+	}
+	return last;
+}
+
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -1759,41 +1778,31 @@ Return a concise summary of what you did and the key findings.`,
 							updateWidget();
 							return;
 						}
-						cleanup();
+						// cleanup 前先取 usage（cleanup 会删除 asyncTasks 条目）
+						const usage = asyncTasks.get(taskId)?.usage;
 						// 从日志读取完整输出并解析 NDJSON
 						let rawOutput = "";
 						try { rawOutput = fs.readFileSync(logPath, "utf-8"); } catch {}
+						const finalText = extractAssistantFinalText(rawOutput);
 
-						let finalText = "";
-						for (const line of rawOutput.split("\n")) {
-							if (!line.trim()) continue;
-							try {
-								const event = JSON.parse(line);
-								if (event.type === "message_end" && event.message?.role === "assistant") {
-									const parts = event.message.content || [];
-									finalText = parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n").trim();
-								}
-							} catch {}
-						}
-
+						cleanup();
 						updateWidget();
 						try {
 							const resultKey = `agent:${agentName}:${taskId}`;
 							const summary = finalText
 								? finalText.slice(0, 500)
 								: "(no output)";
-							const usage = asyncTasks.get(taskId)?.usage;
 							pi.appendEntry({ key: resultKey, value: { agent: agentName, task: taskText, exitCode: 0, output: finalText, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() } });
-						} catch {}
-						if (finalText) {
-							try {
-								const u = asyncTasks.get(taskId)?.usage;
-								const usageLine = u && u.turns > 0
-									? (u.contextWindow ? ` [ctx ${((u.contextTokens / u.contextWindow) * 100).toFixed(1)}%/${fmtCompact(u.contextWindow)}]` : ` [ctx ${fmtCompact(u.contextTokens)}]`)
-									: "";
-								pi.sendUserMessage(`Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`, { deliverAs: "steer" });
-							} catch {}
-						}
+						} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
+						try {
+							const usageLine = usage && usage.turns > 0
+								? (usage.contextWindow ? ` [ctx ${((usage.contextTokens / usage.contextWindow) * 100).toFixed(1)}%/${fmtCompact(usage.contextWindow)}]` : ` [ctx ${fmtCompact(usage.contextTokens)}]`)
+								: "";
+							const body = finalText
+								? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
+								: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
+							pi.sendUserMessage(body, { deliverAs: "steer" });
+						} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 					};
 
 					updateWidget();
@@ -1882,35 +1891,28 @@ Return a concise summary of what you did and the key findings.`,
 				updateWidget();
 				return;
 			}
+			// cleanup 前先取 usage（cleanup 会删除 asyncTasks 条目）
+			const usage = asyncTasks.get(taskId)?.usage;
+			const finalText = extractAssistantFinalText(rawStdout);
 			cleanupFallback();
-			let finalText = "";
-			for (const line of rawStdout.split("\n")) {
-				if (!line.trim()) continue;
-				try {
-					const event = JSON.parse(line);
-					if (event.type === "message_end" && event.message?.role === "assistant") {
-						const parts = event.message.content || [];
-						finalText = parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n").trim();
-					}
-				} catch {}
-			}
 			updateWidget();
 			try {
 				const resultKey = `agent:${agentName}:${taskId}`;
 				const summary = code === 0
 					? (finalText || "(no output)").slice(0, 500)
 					: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
-				const usage = asyncTasks.get(taskId)?.usage;
 				pi.appendEntry({ key: resultKey, value: { agent: agentName, task: taskText, exitCode: code, output: finalText || stderr, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() } });
-			} catch {}
-			if (code === 0 && finalText) {
+			} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
+			if (code === 0) {
 				try {
-					const u = asyncTasks.get(taskId)?.usage;
-					const usageLine = u && u.turns > 0
-						? (u.contextWindow ? ` [ctx ${((u.contextTokens / u.contextWindow) * 100).toFixed(1)}%/${fmtCompact(u.contextWindow)}]` : ` [ctx ${fmtCompact(u.contextTokens)}]`)
+					const usageLine = usage && usage.turns > 0
+						? (usage.contextWindow ? ` [ctx ${((usage.contextTokens / usage.contextWindow) * 100).toFixed(1)}%/${fmtCompact(usage.contextWindow)}]` : ` [ctx ${fmtCompact(usage.contextTokens)}]`)
 						: "";
-					pi.sendUserMessage(`Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`, { deliverAs: "steer" });
-				} catch {}
+					const body = finalText
+						? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
+						: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
+					pi.sendUserMessage(body, { deliverAs: "steer" });
+				} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 			}
 		});
 
