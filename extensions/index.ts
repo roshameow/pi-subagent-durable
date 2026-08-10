@@ -846,6 +846,16 @@ function getAsyncTasks(): Map<string, AsyncTaskEntry> {
 }
 const asyncTasks = getAsyncTasks();
 
+// 诊断:记录扩展加载 + rmux 可用性(帮助排查"新 pi 看不到 subagent")
+function diagLog(msg: string) {
+	try {
+		fs.appendFileSync(path.join(getAgentLogDir(), "extension-diag.log"), `[${new Date().toISOString()}] pid=${process.pid} ${msg}\n`);
+	} catch {}
+}
+try {
+	diagLog(`loaded; rmux=${checkRmuxAvailable()}`);
+} catch {}
+
 // ── subagent 管理辅助：主 agent 可直接 kill / 重连运行中的子 agent ──
 
 // 从 agent-logs 首行 session 事件解析 pi 会话 id（--session 重连用）
@@ -963,6 +973,7 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 		});
 	}
 	_extCache = { at: now, map: out };
+	diagLog(`discover: found=${out.size} [${[...out.keys()].join(",")}]`);
 	return out;
 }
 
