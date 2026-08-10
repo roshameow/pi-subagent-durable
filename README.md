@@ -93,6 +93,15 @@ Changes to agent definitions are picked up on the next call (no reload needed).
 
 Each subagent reports its context usage like the main agent footer: `21.6%/1m` (tokens from `message_end.usage`, window from `models-store.json`). Shown in the widget, `subagent_list`, `/agent-live`, and completion notifications.
 
+### Completion notifications
+
+When a subagent finishes, the main session is notified via `pi.sendUserMessage(..., { deliverAs: "steer" })` with the agent's final text output (and usage). Notifications are **always** sent on success:
+
+- If the agent produced a final text summary, that summary is delivered (capped at 4000 chars).
+- If the agent ended with a tool-call-only or empty final message (e.g. after polling an async job), the notification falls back to `已完成任务，但无文本输出` so the main agent still knows the task finished — plus a pointer to `/agent-results` or `subagent_reload` to inspect/continue.
+
+Both the RMUX and spawn-fallback completion paths behave the same way. Errors in result persistence / notification are logged to the extension console rather than silently dropped.
+
 ## How it works
 
 ```
@@ -114,6 +123,11 @@ pi (main session)
 - Subagents inherit the project's `.mcp.json` config when present (`--mcp-config`), so a shared MCP server works out of the box.
 - This package replaces pi's built-in `subagent` tool with the durable version.
 - Avoid `/reload` while subagents are mid-flight (old task closures keep running on the old module instance); prefer `subagent_reload` to hot-update a running agent.
+
+## Recent fixes
+
+- **Completion notification when a subagent ends with empty text** — previously the completion notification was only sent when the parsed `finalText` was non-empty, and `finalText` came from the *last* `message_end` only. A subagent that finished with a tool-call-only / empty assistant message (common after polling an async backtest) produced empty text, so the main agent never got notified. Fixed by extracting the last **non-empty** assistant text across all `message_end` events and always notifying on success (with a fallback message when there is no text).
+- **Completion notify without `deliverAs` threw during streaming** — `pi.sendUserMessage()` during an active main turn required a `streamingBehavior`; results were dropped and an extension error surfaced. Now uses `{ deliverAs: "steer" }` so results are queued and delivered after the current turn's tool calls finish.
 
 ## Development
 
