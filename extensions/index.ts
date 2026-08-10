@@ -884,13 +884,95 @@ async function killTask(taskId: string): Promise<boolean> {
 	return false;
 }
 
+// ── 从文件系统发现运行中的任务 ──
+// subagent_list / 实时 UI 只遍历当前 pi 进程内存里的 asyncTasks,看不到其他 pi
+// 进程 spawn 的子代理。这里扫描 agent-logs,进程存活(ps)或 rmux 窗口存在即视为
+// running,合并进列表(带 3s 缓存,避免高频轮询时反复 execSync)。
+let _extCache: { at: number; map: Map<string, AsyncTaskEntry> } | null = null;
+function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
+	const now = Date.now();
+	if (_extCache && now - _extCache.at < 3000) return _extCache.map;
+	const out = new Map<string, AsyncTaskEntry>();
+	const dir = getAgentLogDir();
+	let names: string[] = [];
+	try { names = fs.readdirSync(dir); } catch { return out; }
+	// rmux pi-agents 窗口名集合(判断 rmux 存活)
+	const rmuxWinName = (line: string): string => {
+		// "3: _worker-task-xxx (1 panes)..." -> "_worker-task-xxx"
+		return line.replace(/^\d+:\s*/, "").split(/\s+/)[0].replace(/\*$/, "");
+	};
+	let rmuxWindows = new Set<string>();
+	try {
+		const r = execSync("rmux list-windows -t pi-agents", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 });
+		rmuxWindows = new Set(String(r).split("\n").map((l) => rmuxWinName(l)).filter(Boolean));
+	} catch {}
+	// 非 rmux 路径:进程存活
+	let psOut = "";
+	try { psOut = String(execSync("ps -axo command", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 })); } catch {}
+	for (const name of names) {
+		if (!name.startsWith("task-") || !name.endsWith(".jsonl")) continue;
+		const taskId = name.slice(5, -6);
+		if (asyncTasks.has(taskId)) continue; // 当前进程 spawn 的,内存里有
+		const logPath = path.join(dir, name);
+		let raw = "";
+		try { raw = fs.readFileSync(logPath, "utf-8"); } catch { continue; }
+		const lines = raw.split("\n").filter(Boolean);
+		if (!lines.length) continue;
+		// 结束检测:最后一行是终态事件则跳过
+		let lastType = "";
+		try { lastType = (JSON.parse(lines[lines.length - 1]).type || "") as string; } catch {}
+		if (lastType === "agent_end" || lastType === "agent_settled") continue;
+		const winName = [...rmuxWindows].find((w) => w.includes(taskId));
+		const alive = winName ? true : psOut.includes(`task-${taskId}.jsonl`);
+		if (!alive) continue;
+		// agent 名:窗口名 <agent>-task-<id>
+		let agent = "unknown";
+		if (winName) {
+			const m = /^([\w-]+)-task-/.exec(winName);
+			if (m) agent = m[1];
+		}
+		// task 文本:首条 user 消息
+		let task = "";
+		try {
+			for (const l of lines.slice(1, 25)) {
+				const ev = JSON.parse(l);
+				if (ev.type === "message" && ev.message?.role === "user" && Array.isArray(ev.message.content)) {
+					task = typeof ev.message.content[0]?.text === "string" ? ev.message.content[0].text : "";
+					if (task) break;
+				}
+			}
+		} catch {}
+		let cwd = "";
+		try { cwd = (JSON.parse(lines[0]).cwd as string) || ""; } catch {}
+		let startTime = now;
+		try { startTime = fs.statSync(logPath).mtimeMs; } catch {}
+		out.set(taskId, {
+			agent,
+			task: task.slice(0, 300),
+			startTime,
+			useRmux: !!winName,
+			rmuxTarget: winName ? `pi-agents:${winName}.0` : undefined,
+			rmuxAttachCmd: "rmux attach -t pi-agents",
+			cwd: cwd || undefined,
+			sessionId: getTaskSessionId(taskId) || undefined,
+			proc: { killed: false, exitCode: null },
+		});
+	}
+	_extCache = { at: now, map: out };
+	return out;
+}
+
 // 按 taskId / agent / sessionId 模糊匹配运行中的任务（不传参数 = 全部）
 function findRunningTasks(opts: { taskId?: string; agent?: string; sessionId?: string }): { taskId: string; entry: AsyncTaskEntry }[] {
 	const q = (opts.taskId || "").toLowerCase();
 	const a = (opts.agent || "").toLowerCase();
 	const s = (opts.sessionId || "").toLowerCase();
 	const out: { taskId: string; entry: AsyncTaskEntry }[] = [];
-	for (const [id, entry] of asyncTasks) {
+	const all = new Map(asyncTasks);
+	for (const [id, e] of discoverExternalTasks()) {
+		if (!all.has(id)) all.set(id, e);
+	}
+	for (const [id, entry] of all) {
 		const alive = entry.useRmux ? Boolean(entry.rmuxTarget) : (entry.proc && !entry.proc.killed && entry.proc.exitCode === null);
 		if (!alive) continue;
 		if (!q && !a && !s) { out.push({ taskId: id, entry }); continue; }
@@ -2034,7 +2116,11 @@ Return a concise summary of what you did and the key findings.`,
 			}
 
 			private runningTasks() {
-				return Array.from(asyncTasks.entries()).filter(([_, t]) => !t.proc.killed && t.proc.exitCode === null);
+				const all = new Map(asyncTasks);
+				for (const [id, e] of discoverExternalTasks()) {
+					if (!all.has(id)) all.set(id, e);
+				}
+				return Array.from(all.entries()).filter(([_, t]) => !t.proc.killed && t.proc.exitCode === null);
 			}
 
 			private refresh() {
