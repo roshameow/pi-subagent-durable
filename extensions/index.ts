@@ -977,6 +977,29 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 	return out;
 }
 
+
+// ── 子代理 widget:合并内存 + 文件系统发现的任务,供事件驱动和周期刷新共用 ──
+function renderSubagentWidget(u: any) {
+	if (!u) return;
+	const now = Date.now();
+	const lines: string[] = [];
+	let running = 0, done = 0;
+	const all = new Map(asyncTasks);
+	for (const [id, e] of discoverExternalTasks()) {
+		if (!all.has(id)) all.set(id, e);
+	}
+	for (const [id, t] of all) {
+		const alive = t.useRmux ? Boolean(t.rmuxTarget) : (t.proc && !t.proc.killed && t.proc.exitCode === null);
+		if (!alive) { done++; continue; }
+		running++;
+		const summary = (t.task || "").length > 70 ? t.task.slice(0, 70) + "…" : t.task;
+		const elapsed = Math.round((now - t.startTime) / 1000);
+		lines.push(`  ⏳ [${id}] ${t.agent}: ${summary} (${elapsed}s)${fmtUsageShort(t.usage)}`);
+	}
+	const status = `⚡ Agents: ${running} running, ${done} done`;
+	if (running > 0 || done > 0) u.setWidget("z_subagent_tasks", [status, ...lines]);
+	else u.setWidget("z_subagent_tasks", []);
+}
 // 按 taskId / agent / sessionId 模糊匹配运行中的任务（不传参数 = 全部）
 function findRunningTasks(opts: { taskId?: string; agent?: string; sessionId?: string }): { taskId: string; entry: AsyncTaskEntry }[] {
 	const q = (opts.taskId || "").toLowerCase();
@@ -2353,6 +2376,7 @@ Return a concise summary of what you did and the key findings.`,
 			globalThis.__pi_subagent_widget_timer__ = setInterval(() => {
 				if (sessionUI) renderSubagentWidget(sessionUI);
 			}, 4000);
+			(globalThis.__pi_subagent_widget_timer__ as any).unref?.();
 		}
 	});
 }
