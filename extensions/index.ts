@@ -113,6 +113,22 @@ function extractAssistantFinalText(raw: string): string {
 	return last;
 }
 
+// 检测最后一次 assistant message_end 是否 stopReason=error（turn 被模型/provider 错误打断）。
+// 这类崩溃不会留下文本输出，但主 agent 应知道是「中断」而不是「正常完成」。
+function extractStopReason(raw: string): string | undefined {
+	let last: string | undefined;
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const event = JSON.parse(line);
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				if (event.message.stopReason) last = event.message.stopReason;
+			}
+		} catch {}
+	}
+	return last;
+}
+
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -1784,14 +1800,17 @@ Return a concise summary of what you did and the key findings.`,
 						let rawOutput = "";
 						try { rawOutput = fs.readFileSync(logPath, "utf-8"); } catch {}
 						const finalText = extractAssistantFinalText(rawOutput);
+						const stopReason = extractStopReason(rawOutput);
 
 						cleanup();
 						updateWidget();
 						try {
 							const resultKey = `agent:${agentName}:${taskId}`;
-							const summary = finalText
-								? finalText.slice(0, 500)
-								: "(no output)";
+							const summary = stopReason === "error"
+								? `interrupted (${stopReason}): ${finalText.slice(0, 300) || "model/provider error, no text output"}`
+								: finalText
+									? finalText.slice(0, 500)
+									: "(no output)";
 							pi.appendEntry({ key: resultKey, value: { agent: agentName, task: taskText, exitCode: 0, output: finalText, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() } });
 						} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
 						try {
@@ -1800,7 +1819,9 @@ Return a concise summary of what you did and the key findings.`,
 								: "";
 							const body = finalText
 								? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
-								: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
+								: stopReason === "error"
+									? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：最后一轮被模型/provider 错误打断（stopReason=error），无文本输出。可用 subagent_reload 恢复该任务继续。`
+									: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
 							pi.sendUserMessage(body, { deliverAs: "steer" });
 						} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 					};
@@ -1894,13 +1915,16 @@ Return a concise summary of what you did and the key findings.`,
 			// cleanup 前先取 usage（cleanup 会删除 asyncTasks 条目）
 			const usage = asyncTasks.get(taskId)?.usage;
 			const finalText = extractAssistantFinalText(rawStdout);
+			const stopReason = extractStopReason(rawStdout);
 			cleanupFallback();
 			updateWidget();
 			try {
 				const resultKey = `agent:${agentName}:${taskId}`;
-				const summary = code === 0
-					? (finalText || "(no output)").slice(0, 500)
-					: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
+				const summary = stopReason === "error"
+					? `interrupted (${stopReason}): ${finalText.slice(0, 300) || "model/provider error, no text output"}`
+					: code === 0
+						? (finalText || "(no output)").slice(0, 500)
+						: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
 				pi.appendEntry({ key: resultKey, value: { agent: agentName, task: taskText, exitCode: code, output: finalText || stderr, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() } });
 			} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
 			if (code === 0) {
@@ -1910,7 +1934,9 @@ Return a concise summary of what you did and the key findings.`,
 						: "";
 					const body = finalText
 						? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
-						: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
+						: stopReason === "error"
+							? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：最后一轮被模型/provider 错误打断（stopReason=error），无文本输出。可用 subagent_reload 恢复该任务继续。`
+							: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
 					pi.sendUserMessage(body, { deliverAs: "steer" });
 				} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 			}
