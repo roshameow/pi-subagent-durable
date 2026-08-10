@@ -1828,40 +1828,7 @@ Return a concise summary of what you did and the key findings.`,
 					};
 
 					const updateWidget = () => {
-						const u = ui || sessionUI;
-						if (!u) return;
-						const now = Date.now();
-						const lines: string[] = [];
-						let running = 0, doneCount = 0;
-						for (const [id, t] of asyncTasks) {
-							const elapsed = Math.round((now - t.startTime) / 1000);
-							if (t.useRmux && t.rmuxTarget) {
-								// 非阻塞检查
-								rmux.cmd("list-panes", "-t", t.rmuxTarget).then(p => {
-									const isDead = p.stdout?.includes("(dead)") ?? false;
-									if (isDead) {
-										// widget 更新时忽略已完成的
-									}
-								}).catch(() => {});
-								running++;
-								const summary = t.task.length > 60 ? t.task.slice(0, 60) + "…" : t.task;
-								lines.push(`  ⏳ [${id}] ${t.agent}: ${summary} (${elapsed}s)${fmtUsageShort(t.usage)}`);
-								if (elapsed % 15 < 2) lines.push(`    rmux: ${t.rmuxAttachCmd}`);
-							} else if (t.proc) {
-								const alive = !t.proc.killed && t.proc.exitCode === null;
-								if (alive) {
-									running++;
-									const summary = t.task.length > 60 ? t.task.slice(0, 60) + "…" : t.task;
-									lines.push(`  ⏳ [${id}] ${t.agent}: ${summary} (${elapsed}s)`);
-								} else {
-									doneCount++;
-								}
-							}
-						}
-						const status = `⚡ Agents: ${running} running, ${doneCount} done`;
-						const widgetLines = [status, ...lines];
-						if (running > 0 || doneCount > 0) u.setWidget("z_subagent_tasks", widgetLines);
-						else u.setWidget("z_subagent_tasks", []);
+						renderSubagentWidget(ui || sessionUI);
 					};
 
 					// 监控完成：轮询 pane 状态（returnCode 为 0 表示窗口/ pane 还活着，非 0 表示已消失=完成）
@@ -1980,26 +1947,7 @@ Return a concise summary of what you did and the key findings.`,
 		});
 
 		const updateWidget = () => {
-			const u = ui || sessionUI;
-			if (!u) return;
-			const now = Date.now();
-			const lines: string[] = [];
-			let running = 0, done = 0;
-			for (const [id, t] of asyncTasks) {
-				const alive = !t.proc.killed && t.proc.exitCode === null;
-				const elapsed = Math.round((now - t.startTime) / 1000);
-				if (alive) {
-					running++;
-					const summary = t.task.length > 80 ? t.task.slice(0, 80) + "…" : t.task;
-					lines.push(`  ⏳ [${id}] ${t.agent}: ${summary} (${elapsed}s)${fmtUsageShort(t.usage)}`);
-				} else {
-					done++;
-				}
-			}
-			const status = `⚡ Agents: ${running} running, ${done} done`;
-			const widgetLines = [status, ...lines];
-			if (running > 0 || done > 0) u.setWidget("z_subagent_tasks", widgetLines);
-			else u.setWidget("z_subagent_tasks", []);
+			renderSubagentWidget(ui || sessionUI);
 		};
 
 		proc.on("close", (code: number | null) => {
@@ -2395,10 +2343,16 @@ Return a concise summary of what you did and the key findings.`,
 		} catch { /* ignore */ }
 	}
 
-	// ── session_start: footer + UI 引用 ──
+	// ── session_start: footer + UI 引用 + 周期刷新子代理 widget ──
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
 		const discovery = discoverAgents(ctx.cwd, "both");
 		ctx.ui.setStatus("z_agents", ctx.ui.theme.fg("accent", `Agents: ${discovery.agents.length}`));
+		// 4s 周期刷新:让新 pi 也能显示其他进程运行中的子代理(外部任务)
+		if (!globalThis.__pi_subagent_widget_timer__) {
+			globalThis.__pi_subagent_widget_timer__ = setInterval(() => {
+				if (sessionUI) renderSubagentWidget(sessionUI);
+			}, 4000);
+		}
 	});
 }
