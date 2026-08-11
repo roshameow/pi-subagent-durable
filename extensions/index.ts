@@ -1017,8 +1017,12 @@ function renderSubagentWidget(u: any) {
 	// 父会话 id == 当前会话的外部任务。原来把全进程任务列表合并进来,
 	// 导致每个 pi 会话的 terminal 都显示同样的 widget,而不是只在父会话。
 	const all = new Map(asyncTasks);
+	let diagMatched = 0;
 	for (const [id, e] of discoverExternalTasks()) {
-		if (!all.has(id) && e.sessionId === currentSessionId) all.set(id, e);
+		if (!all.has(id) && e.sessionId === currentSessionId) { all.set(id, e); diagMatched++; }
+	}
+	if (diagMatched > 0 || (all.size > 0 && all.size <= 3)) {
+		try { fs.appendFileSync(path.join(getAgentLogDir(), "extension-diag.log"), `[${new Date().toISOString()}] pid=${process.pid} widget: curSess=${currentSessionId} tasks=${all.size} matched=${diagMatched}\n`); } catch {}
 	}
 	for (const [id, t] of all) {
 		const alive = t.useRmux ? Boolean(t.rmuxTarget) : (t.proc && !t.proc.killed && t.proc.exitCode === null);
