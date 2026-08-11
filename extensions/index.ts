@@ -816,6 +816,7 @@ const SubagentParams = Type.Object({
 // ── 全局跟踪异步任务 ──
 let taskCounter = 0;
 let sessionUI: any = null;
+let currentSessionId = ""; // 本 pi 会话的 id, session_start 时从 sessionManager 取
 
 function generateTaskId(): string {
 	const ts = Date.now().toString(36);
@@ -989,7 +990,7 @@ function renderSubagentWidget(u: any) {
 	// 导致每个 pi 会话的 terminal 都显示同样的 widget,而不是只在父会话。
 	const all = new Map(asyncTasks);
 	for (const [id, e] of discoverExternalTasks()) {
-		if (!all.has(id) && e.sessionId === sessionId) all.set(id, e);
+		if (!all.has(id) && e.sessionId === currentSessionId) all.set(id, e);
 	}
 	for (const [id, t] of all) {
 		const alive = t.useRmux ? Boolean(t.rmuxTarget) : (t.proc && !t.proc.killed && t.proc.exitCode === null);
@@ -1009,12 +1010,9 @@ function findRunningTasks(opts: { taskId?: string; agent?: string; sessionId?: s
 	const a = (opts.agent || "").toLowerCase();
 	const s = (opts.sessionId || "").toLowerCase();
 	const out: { taskId: string; entry: AsyncTaskEntry }[] = [];
-	// 只显示与当前会话相关的任务:本进程 spawn 的(内存) + 其他进程里
-	// 父会话 id == 当前会话的外部任务。原来把全进程任务列表合并进来,
-	// 导致每个 pi 会话的 terminal 都显示同样的 widget,而不是只在父会话。
 	const all = new Map(asyncTasks);
 	for (const [id, e] of discoverExternalTasks()) {
-		if (!all.has(id) && e.sessionId === sessionId) all.set(id, e);
+		if (!all.has(id)) all.set(id, e);
 	}
 	for (const [id, entry] of all) {
 		const alive = entry.useRmux ? Boolean(entry.rmuxTarget) : (entry.proc && !entry.proc.killed && entry.proc.exitCode === null);
@@ -2375,6 +2373,7 @@ Return a concise summary of what you did and the key findings.`,
 	// ── session_start: footer + UI 引用 + 周期刷新子代理 widget ──
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
+		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
 		const discovery = discoverAgents(ctx.cwd, "both");
 		ctx.ui.setStatus("z_agents", ctx.ui.theme.fg("accent", `Agents: ${discovery.agents.length}`));
 		// 4s 周期刷新:让新 pi 也能显示其他进程运行中的子代理(外部任务)
