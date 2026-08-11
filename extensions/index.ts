@@ -147,6 +147,8 @@ const crypto = require("crypto");
 const outPath = process.argv[2];       // 过滤后的事件流（agent-logs）
 const sessionPath = process.argv[3];   // session 格式镜像（可 pi --export）
 const cwd = process.argv[4] || ".";
+const parentId = process.argv[5] || ""; // 父会话 id（widget 归属用）
+let parentWritten = false;
 let pending = "";
 let lastParentId = null;
 let lastEntryId = null;
@@ -223,6 +225,11 @@ function handleLine(line) {
     sessionId = ev.id || genId();
     const header = { type: "session", version: 3, id: sessionId, timestamp: ev.timestamp || new Date().toISOString(), cwd: ev.cwd || cwd };
     fs.appendFileSync(sessionPath, JSON.stringify(header) + "\n");
+    // 把父会话 id 写进 agent-log（widget 按父会话归属任务）
+    if (parentId && !parentWritten) {
+      parentWritten = true;
+      process.stdout.write(JSON.stringify({ type: "pi_subagent_parent", parentId }) + "\n");
+    }
     lastParentId = null; lastEntryId = null;
   }
   else if (ev.type === "message_end") {
@@ -347,6 +354,11 @@ function filterJsonlLine(line: string, sessionPath?: string, cwd?: string): stri
 					cwd: ev.cwd || cwd || ".",
 				};
 				fs.appendFileSync(sessionPath, JSON.stringify(header) + "\n");
+				// 父会话 marker(fallback 路径;rmux 路径由 filter 脚本写)
+				if (currentSessionId && !fbParentWritten) {
+					fbParentWritten = true;
+					return JSON.stringify({ type: "pi_subagent_parent", parentId: currentSessionId }) + "\n" + line;
+				}
 			} else if (ev.type === "message_end") {
 				if (!_sessionState) {
 					_sessionState = { file: sessionPath, lastId: null, id: genSessionEntryId() };
@@ -817,6 +829,7 @@ const SubagentParams = Type.Object({
 let taskCounter = 0;
 let sessionUI: any = null;
 let currentSessionId = ""; // 本 pi 会话的 id, session_start 时从 sessionManager 取
+let fbParentWritten = false; // fallback spawn 路径的父会话 marker 已写
 
 function generateTaskId(): string {
 	const ts = Date.now().toString(36);
@@ -863,12 +876,27 @@ try {
 function getTaskSessionId(taskId: string): string | null {
 	try {
 		const raw = fs.readFileSync(getAgentLogPath(taskId), "utf-8");
-		const first = raw.split("\n").find((l) => l.trim());
-		if (!first) return null;
-		const ev = JSON.parse(first);
-		if (ev.type === "session" && ev.id) return ev.id;
+		for (const l of raw.split("\n")) {
+			if (!l.trim()) continue;
+			const ev = JSON.parse(l);
+			if (ev.type === "session" && ev.id) return ev.id;
+		}
 	} catch {}
 	return null;
+}
+
+// 任务所属的父会话 id:优先 agent-log 里的 pi_subagent_parent marker
+//(spawn 时由 filter 脚本写入);老任务 fallback 到 agent-log 首行 session id
+function getTaskParentSessionId(taskId: string): string | null {
+	try {
+		const raw = fs.readFileSync(getAgentLogPath(taskId), "utf-8");
+		for (const l of raw.split("\n")) {
+			if (!l.trim()) continue;
+			const ev = JSON.parse(l);
+			if (ev.type === "pi_subagent_parent" && ev.parentId) return ev.parentId;
+		}
+	} catch {}
+	return getTaskSessionId(taskId);
 }
 
 // 主动 kill 一个运行中的任务（rmux 窗口或 spawn 进程），并标记 intentionalKill
@@ -969,7 +997,7 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 			rmuxTarget: winName ? `pi-agents:${winName}.0` : undefined,
 			rmuxAttachCmd: "rmux attach -t pi-agents",
 			cwd: cwd || undefined,
-			sessionId: getTaskSessionId(taskId) || undefined,
+			sessionId: getTaskParentSessionId(taskId) || undefined,
 			proc: { killed: false, exitCode: null },
 		});
 	}
@@ -1838,7 +1866,7 @@ Return a concise summary of what you did and the key findings.`,
 				const sessionPath = getSubagentSessionPath(taskId, cwd);
 				try { fs.writeFileSync(sessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
 				const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-					`cd ${cwd} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} >> ${logPath}`);
+					`cd ${cwd} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${logPath}`);
 
 				if (r.returnCode === 0) {
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
@@ -1846,7 +1874,7 @@ Return a concise summary of what you did and the key findings.`,
 					asyncTasks.set(taskId, {
 						agent: agentName, task: taskText, proc: dummyProc, startTime: Date.now(),
 						useRmux: true, rmuxTarget, rmuxAttachCmd: attachCmd,
-						cwd, sessionId: resumeSessionId || undefined,
+						cwd, sessionId: resumeSessionId || currentSessionId || undefined,
 					});
 
 					const cleanup = () => {
@@ -1934,7 +1962,7 @@ Return a concise summary of what you did and the key findings.`,
 		asyncTasks.set(taskId, {
 			agent: agentName, task: taskText, proc, startTime: Date.now(),
 			useRmux: false,
-			cwd, sessionId: resumeSessionId || undefined,
+			cwd, sessionId: resumeSessionId || currentSessionId || undefined,
 		});
 
 		let rawStdout = "";
