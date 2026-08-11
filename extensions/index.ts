@@ -2401,9 +2401,26 @@ Return a concise summary of what you did and the key findings.`,
 	}
 
 	// ── session_start: footer + UI 引用 + 周期刷新子代理 widget ──
+	// 单引号转义(rmux 选项值)
+	const sq = (x: string) => `'${x.replace(/'/g, "'\\''")}'`;
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
+		// 自注册:把本 pi 的会话文件写进所在 rmux 窗口的 @pi_session 选项,
+		// 桌面端读选项即可精确归属(pim / Open TUI 任何 pane 都可靠),
+		// 不再依赖"最接近启动时间"启发式(空闲会话会误判)
+		try {
+			const sessFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
+			let win = "";
+			try { win = execSync("rmux display-message -p '#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim(); } catch {}
+			if (sessFile && win) {
+				execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
+					stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
+				});
+			}
+		} catch (e: any) {
+			try { fs.appendFileSync(path.join(getAgentLogDir(), "extension-diag.log"), `[${new Date().toISOString()}] pid=${process.pid} reg ERR ${String(e).slice(0, 150)}\n`); } catch {}
+		}
 		const discovery = discoverAgents(ctx.cwd, "both");
 		ctx.ui.setStatus("z_agents", ctx.ui.theme.fg("accent", `Agents: ${discovery.agents.length}`));
 		// 4s 周期刷新:让新 pi 也能显示其他进程运行中的子代理(外部任务)
