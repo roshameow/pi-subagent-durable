@@ -2447,7 +2447,10 @@ Return a concise summary of what you did and the key findings.`,
 			const sessFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
 			let win = "";
 			try { win = execSync("rmux display-message -p '#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim(); } catch {}
-			if (sessFile && win) {
+			// 只在真正身处 rmux pane 时自注册:非 tmux 上下文(终端里的 pi)执行
+			// display-message 会返回“上次活跃的 rmux 窗口”,把 @pi_session 写进
+			// 别人的窗口,导致桌面端归属错乱(终端 pi 被显示成 rmux)。
+			if (sessFile && win && process.env.TMUX) {
 				execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
 					stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
 				});
