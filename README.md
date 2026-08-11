@@ -93,6 +93,8 @@ Changes to agent definitions are picked up on the next call (no reload needed).
 
 Each subagent reports its context usage like the main agent footer: `21.6%/1m` (tokens from `message_end.usage`, window from `models-store.json`). Shown in the widget, `subagent_list`, `/agent-live`, and completion notifications.
 
+The footer widget only shows tasks belonging to the CURRENT session (parent session id is recorded in each task's agent-log via a `pi_subagent_parent` marker at spawn, and re-registered on `/reload`); every pi also registers its session file into its rmux window's `@pi_session` option so the desktop app can attribute panes exactly.
+
 ### Completion notifications
 
 When a subagent finishes, the main session is notified via `pi.sendUserMessage(..., { deliverAs: "steer" })` with the agent's final text output (and usage). Notifications are **always** sent on success:
