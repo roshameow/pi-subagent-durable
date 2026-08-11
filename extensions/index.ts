@@ -2406,6 +2406,10 @@ Return a concise summary of what you did and the key findings.`,
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
+		// reload 安全:把会话状态存到 globalThis,新模块加载时恢复
+		const g = globalThis as any;
+		g.__pi_subagent_ui__ = ctx.ui;
+		g.__pi_subagent_sid__ = currentSessionId;
 		// 自注册:把本 pi 的会话文件写进所在 rmux 窗口的 @pi_session 选项,
 		// 桌面端读选项即可精确归属(pim / Open TUI 任何 pane 都可靠),
 		// 不再依赖"最接近启动时间"启发式(空闲会话会误判)
@@ -2418,6 +2422,7 @@ Return a concise summary of what you did and the key findings.`,
 					stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
 				});
 			}
+			g.__pi_subagent_sfile__ = sessFile;
 		} catch (e: any) {
 			try { fs.appendFileSync(path.join(getAgentLogDir(), "extension-diag.log"), `[${new Date().toISOString()}] pid=${process.pid} reg ERR ${String(e).slice(0, 150)}\n`); } catch {}
 		}
@@ -2425,10 +2430,29 @@ Return a concise summary of what you did and the key findings.`,
 		ctx.ui.setStatus("z_agents", ctx.ui.theme.fg("accent", `Agents: ${discovery.agents.length}`));
 		// 4s 周期刷新:让新 pi 也能显示其他进程运行中的子代理(外部任务)
 		if (!globalThis.__pi_subagent_widget_timer__) {
+			// 定时器经 globalThis tick 间接调用:reload 后旧定时器仍存在
+			//(全局防重),但会调用新模块的 tick -> 新 renderSubagentWidget
 			globalThis.__pi_subagent_widget_timer__ = setInterval(() => {
-				if (sessionUI) renderSubagentWidget(sessionUI);
+				const tick = (globalThis as any).__pi_subagent_widget_tick__;
+				if (tick) tick();
 			}, 4000);
 			(globalThis.__pi_subagent_widget_timer__ as any).unref?.();
 		}
 	});
+
+	// reload 安全:模块(重)加载时恢复会话状态、重注册归属、更新 tick
+	function initWidgetState() {
+		const g = globalThis as any;
+		if (g.__pi_subagent_ui__) sessionUI = g.__pi_subagent_ui__;
+		if (g.__pi_subagent_sid__) currentSessionId = g.__pi_subagent_sid__;
+		const sfile = g.__pi_subagent_sfile__ || "";
+		if (sfile) {
+			try {
+				const win = execSync("rmux display-message -p '#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
+				if (win) execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sfile)}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 });
+			} catch {}
+		}
+		g.__pi_subagent_widget_tick__ = () => { if (sessionUI) renderSubagentWidget(sessionUI); };
+	}
+	initWidgetState();
 }
