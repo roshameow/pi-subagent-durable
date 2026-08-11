@@ -901,25 +901,55 @@ function getTaskParentSessionId(taskId: string): string | null {
 
 // 主动 kill 一个运行中的任务（rmux 窗口或 spawn 进程），并标记 intentionalKill
 // 使该任务随后的完成回调只清理、不通知主会话
+// 注意：entry 可能来自本进程 asyncTasks（自己 spawn 的），也可能来自
+// discoverExternalTasks（父 pi 已死/其他 pi spawn 的孤儿），两种都要能杀。
 async function killTask(taskId: string): Promise<boolean> {
-	const entry = asyncTasks.get(taskId);
+	const entry = asyncTasks.get(taskId) || discoverExternalTasks().get(taskId);
 	if (!entry) return false;
 	entry.intentionalKill = true;
 	try {
 		if (entry.useRmux && entry.rmuxTarget) {
-			const rmux = await getRmux();
-			if (rmux) {
-				const windowTarget = entry.rmuxTarget.split(".")[0]; // session:window
-				await rmux.cmd("kill-window", "-t", windowTarget);
-				return true;
+			const windowTarget = entry.rmuxTarget.split(".")[0]; // session:window
+			// 1) 优先 SDK 客户端；客户端可能已 stale（control-mode 连接断掉会 throw）
+			try {
+				const rmux = await getRmux();
+				if (rmux) {
+					await rmux.cmd("kill-window", "-t", windowTarget);
+					diagLog(`kill ok (sdk) ${taskId} -> ${windowTarget}`);
+					return true;
+				}
+			} catch (e) {
+				diagLog(`kill sdk ERR ${taskId} ${windowTarget}: ${String(e).slice(0, 200)}; fallback cli`);
+				rmuxClient = null;
+				rmuxAvailable = null; // 重置，下次 getRmux 会重新探测/连接
 			}
+			// 2) 兜底：直接走 rmux CLI（绕过 stale 的 SDK 客户端）
+			try {
+				execSync(`rmux kill-window -t ${windowTarget}`, { stdio: "ignore", timeout: 8000 });
+				diagLog(`kill ok (cli) ${taskId} -> ${windowTarget}`);
+				return true;
+			} catch (e) {
+				diagLog(`kill cli ERR ${taskId} ${windowTarget}: ${String(e).slice(0, 200)}`);
+			}
+		}
+		// 3) 最终兜底：窗口探测/关闭都失败时按 taskId 杀进程树
+		// （父 pi 已死的孤儿，agent-log 路径/子代理 cmdline 都含 taskId）
+		try {
+			execSync(`pkill -f ${taskId}`, { stdio: "ignore", timeout: 8000 });
+			diagLog(`kill ok (pkill) ${taskId}`);
+			return true;
+		} catch (e) {
+			diagLog(`kill pkill ERR ${taskId}: ${String(e).slice(0, 150)}`);
 		}
 		if (entry.proc) {
 			entry.proc.killed = true;
 			entry.proc.kill();
+			diagLog(`kill ok (proc) ${taskId}`);
 			return true;
 		}
-	} catch {}
+	} catch (e) {
+		diagLog(`kill ERR ${taskId}: ${String(e).slice(0, 200)}`);
+	}
 	return false;
 }
 
@@ -2063,7 +2093,7 @@ Return a concise summary of what you did and the key findings.`,
 
 	// 重连一个运行中的任务：kill 后用 --session 恢复上下文，重新加载工具/扩展/MCP
 	const reloadTask = async (taskId: string, prompt: string, ui: any): Promise<string> => {
-		const entry = asyncTasks.get(taskId);
+		const entry = asyncTasks.get(taskId) || discoverExternalTasks().get(taskId);
 		if (!entry) return `- ${taskId}: task not found`;
 		const sessionId = entry.sessionId || getTaskSessionId(taskId);
 		if (!sessionId) return `- ${taskId} (${entry.agent}): session id not found in agent-logs yet, retry later`;
