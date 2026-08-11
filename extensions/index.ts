@@ -950,7 +950,9 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 	try { psOut = String(execSync("ps -axo command", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 })); } catch {}
 	for (const name of names) {
 		if (!name.startsWith("task-") || !name.endsWith(".jsonl")) continue;
-		const taskId = name.slice(5, -6);
+		// 保留 task- 前缀:genTaskId() 生成的 taskId 就是带前缀的,
+		// getAgentLogPath/asyncTasks 的 key 都按带前缀约定
+		const taskId = name.slice(0, -6);
 		if (asyncTasks.has(taskId)) continue; // 当前进程 spawn 的,内存里有
 		const logPath = path.join(dir, name);
 		let raw = "";
@@ -962,7 +964,7 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 		try { lastType = (JSON.parse(lines[lines.length - 1]).type || "") as string; } catch {}
 		if (lastType === "agent_end" || lastType === "agent_settled") continue;
 		const winName = [...rmuxWindows].find((w) => w.includes(taskId));
-		const alive = winName ? true : psOut.includes(`task-${taskId}.jsonl`);
+		const alive = winName ? true : psOut.includes(`${taskId}.jsonl`);
 		if (!alive) continue;
 		// agent 名:窗口名 <agent>-task-<id>
 		let agent = "unknown";
@@ -1017,12 +1019,8 @@ function renderSubagentWidget(u: any) {
 	// 父会话 id == 当前会话的外部任务。原来把全进程任务列表合并进来,
 	// 导致每个 pi 会话的 terminal 都显示同样的 widget,而不是只在父会话。
 	const all = new Map(asyncTasks);
-	let diagMatched = 0;
 	for (const [id, e] of discoverExternalTasks()) {
-		if (!all.has(id) && e.sessionId === currentSessionId) { all.set(id, e); diagMatched++; }
-	}
-	if (diagMatched > 0 || (all.size > 0 && all.size <= 3)) {
-		try { fs.appendFileSync(path.join(getAgentLogDir(), "extension-diag.log"), `[${new Date().toISOString()}] pid=${process.pid} widget: curSess=${currentSessionId} tasks=${all.size} matched=${diagMatched}\n`); } catch {}
+		if (!all.has(id) && e.sessionId === currentSessionId) all.set(id, e);
 	}
 	for (const [id, t] of all) {
 		const alive = t.useRmux ? Boolean(t.rmuxTarget) : (t.proc && !t.proc.killed && t.proc.exitCode === null);
