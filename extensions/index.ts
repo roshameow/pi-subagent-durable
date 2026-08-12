@@ -2451,9 +2451,23 @@ Return a concise summary of what you did and the key findings.`,
 			// display-message 会返回“上次活跃的 rmux 窗口”,把 @pi_session 写进
 			// 别人的窗口,导致桌面端归属错乱(终端 pi 被显示成 rmux)。
 			if (sessFile && win && process.env.TMUX) {
-				execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
-					stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
-				});
+				// 窗口创建/自动重命名的竞态会让首次 set-option 失败(实测 reg ERR),
+				// 而注册只在 session_start 跑一次——失败就永远没有 @pi_session。
+				// 重试几次,最终失败也留下 diag 记录。
+				for (let i = 0; i < 3; i++) {
+					try {
+						execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
+							stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
+						});
+						break;
+					} catch (e: any) {
+						if (i === 2) {
+							diagLog(`reg ERR ${String(e).slice(0, 150)}`);
+						} else {
+							await new Promise((r) => setTimeout(r, 800));
+						}
+					}
+				}
 			}
 			g.__pi_subagent_sfile__ = sessFile;
 		} catch (e: any) {
