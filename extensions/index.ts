@@ -2451,11 +2451,19 @@ Return a concise summary of what you did and the key findings.`,
 		try {
 			const sessFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
 			let win = "";
-			try { win = execSync("rmux display-message -p '#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim(); } catch {}
-			// 只在真正身处 rmux pane 时自注册:非 tmux 上下文(终端里的 pi)执行
-			// display-message 会返回“上次活跃的 rmux 窗口”,把 @pi_session 写进
-			// 别人的窗口,导致桌面端归属错乱(终端 pi 被显示成 rmux)。
-			if (sessFile && win && process.env.TMUX) {
+			// 用本进程 tty 定位自己的 pane:`rmux display-message` 不带 -t 时在
+			// rmux CLI 上下文里返回的是 daemon 的 current window——新建窗口用
+			// -d(不切过去),竞态下它会落到“上次活跃窗口”,把 @pi_session 写进
+			// 别人的窗口(实测:buggy reload 的子代理把 019fe98d 写进了
+			// pi-quantnight:node)。tty 唯一对应一个 pane,无竞态;不在 tmux
+			// 里(终端 pi)匹配不到 → win 为空 → 不注册。
+			try {
+				const tty = execSync(`ps -o tty= -p ${process.pid}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
+				const panes = execSync("rmux list-panes -a -F '#{pane_tty}|#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).toString();
+				const hit = panes.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => l.split("|")[0].replace(/^\/dev\//, "") === tty);
+				if (hit) win = hit.split("|")[1] ?? "";
+			} catch {}
+			if (sessFile && win) {
 				// 窗口创建/自动重命名的竞态会让首次 set-option 失败(实测 reg ERR),
 				// 而注册只在 session_start 跑一次——失败就永远没有 @pi_session。
 				// 重试几次,最终失败也留下 diag 记录。
