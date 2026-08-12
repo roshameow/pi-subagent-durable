@@ -2457,22 +2457,22 @@ Return a concise summary of what you did and the key findings.`,
 			// 别人的窗口(实测:buggy reload 的子代理把 019fe98d 写进了
 			// pi-quantnight:node)。tty 唯一对应一个 pane,无竞态;不在 tmux
 			// 里(终端 pi)匹配不到 → win 为空 → 不注册。
-			try {
-				const tty = execSync(`ps -o tty= -p ${process.pid}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
-				const panes = execSync("rmux list-panes -a -F '#{pane_tty}|#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).toString();
-				const hit = panes.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => l.split("|")[0].replace(/^\/dev\//, "") === tty);
-				if (hit) win = hit.split("|")[1] ?? "";
-			} catch {}
-			if (sessFile && win) {
-				// 窗口创建/自动重命名的竞态会让首次 set-option 失败(实测 reg ERR),
-				// 而注册只在 session_start 跑一次——失败就永远没有 @pi_session。
-				// 重试几次,最终失败也留下 diag 记录。
+			// 查找和 set-option 都可能撞上窗口创建竞态,整体重试。
+			if (sessFile) {
 				for (let i = 0; i < 3; i++) {
 					try {
-						execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
-							stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
-						});
-						break;
+						const tty = execSync(`ps -o tty= -p ${process.pid}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
+						const panes = execSync("rmux list-panes -a -F '#{pane_tty}|#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).toString();
+						const hit = panes.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => l.split("|")[0].replace(/^\/dev\//, "") === tty);
+						if (hit) {
+							const win = hit.split("|")[1] ?? "";
+							if (win) {
+								execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
+									stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
+								});
+								break;
+							}
+						}
 					} catch (e: any) {
 						if (i === 2) {
 							diagLog(`reg ERR ${String(e).slice(0, 150)}`);
