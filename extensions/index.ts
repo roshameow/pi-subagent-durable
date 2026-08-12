@@ -2438,6 +2438,16 @@ Return a concise summary of what you did and the key findings.`,
 	// ── session_start: footer + UI 引用 + 周期刷新子代理 widget ──
 	// 单引号转义(rmux 选项值)
 	const sq = (x: string) => `'${x.replace(/'/g, "'\\''")}'`;
+	// /new /resume /exit 时删除自己的注册表条目:避免 stale 指向已删会话
+	//(/new 中断时新会话文件可能被 pi 删除,条目就指向不存在了)。
+	// 删除后 desktop 会走兜底;下一个 session_start 会重新写入正确条目。
+	// reload 时模块重载会重复注册,unlink 同一文件幂等,无副作用。
+	pi.on("session_shutdown", () => {
+		try {
+			fs.unlinkSync(path.join(getAgentDir(), "runtime", `${process.pid}.jsonl`));
+		} catch { /* 文件可能不存在,忽略 */ }
+	});
+
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
