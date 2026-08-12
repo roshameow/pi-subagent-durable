@@ -2095,8 +2095,13 @@ Return a concise summary of what you did and the key findings.`,
 	const reloadTask = async (taskId: string, prompt: string, ui: any): Promise<string> => {
 		const entry = asyncTasks.get(taskId) || discoverExternalTasks().get(taskId);
 		if (!entry) return `- ${taskId}: task not found`;
-		const sessionId = entry.sessionId || getTaskSessionId(taskId);
-		if (!sessionId) return `- ${taskId} (${entry.agent}): session id not found in agent-logs yet, retry later`;
+		// resume 的必须是任务**自己**的会话:agent-log 里第一个 session 事件
+		// 才是子代理 pi 的会话。entry.sessionId 是 spawn 时的
+		// `resumeSessionId || currentSessionId` —— 新任务它就是父会话,
+		// 拿它去 resume 会让子代理 append 到父会话的 jsonl(双写损坏,
+		// 实测:reload blog-writer 把父会话 019fe98d 重启了)。
+		const sessionId = getTaskSessionId(taskId);
+		if (!sessionId) return `- ${taskId} (${entry.agent}): task session not in agent-logs yet, retry later`;
 		if (!(await killTask(taskId))) return `- ${taskId} (${entry.agent}): kill failed, session not resumed to avoid double-running`;
 		// 重新发现原 agent 配置（可能已更新），找不到则退回 _worker（恢复全部工具）
 		const cwd = entry.cwd || process.cwd();
