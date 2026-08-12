@@ -2445,12 +2445,16 @@ Return a concise summary of what you did and the key findings.`,
 		const g = globalThis as any;
 		g.__pi_subagent_ui__ = ctx.ui;
 		g.__pi_subagent_sid__ = currentSessionId;
-		// 自注册:把本 pi 的会话文件写进所在 rmux 窗口的 @pi_session 选项,
-		// 桌面端读选项即可精确归属(pim / Open TUI 任何 pane 都可靠),
-		// 不再依赖"最接近启动时间"启发式(空闲会话会误判)
+		// 自注册(两通道):
+		// 1. pid 注册表(私有槽,直连):每个 pi 写 ~/.pi/agent/runtime/<pid>.jsonl,
+		//    桌面端按 pid/panePid 精确查表归属——无共享可变状态,终端 pi 也有
+		//    条目(R1 多终端 pi 结构性解决)。
+		// 2. @pi_session 窗口选项(共享槽,兜底):仅 tmux 内注册,旧版桌面端兼容。
 		try {
 			const sessFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
 			let win = "";
+			let panePid: number | null = null;
+			let tty = "";
 			// 用本进程 tty 定位自己的 pane:`rmux display-message` 不带 -t 时在
 			// rmux CLI 上下文里返回的是 daemon 的 current window——新建窗口用
 			// -d(不切过去),竞态下它会落到“上次活跃窗口”,把 @pi_session 写进
@@ -2458,28 +2462,46 @@ Return a concise summary of what you did and the key findings.`,
 			// pi-quantnight:node)。tty 唯一对应一个 pane,无竞态;不在 tmux
 			// 里(终端 pi)匹配不到 → win 为空 → 不注册。
 			// 查找和 set-option 都可能撞上窗口创建竞态,整体重试。
-			if (sessFile) {
-				for (let i = 0; i < 3; i++) {
-					try {
-						const tty = execSync(`ps -o tty= -p ${process.pid}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
-						const panes = execSync("rmux list-panes -a -F '#{pane_tty}|#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).toString();
-						const hit = panes.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => l.split("|")[0].replace(/^\/dev\//, "") === tty);
-						if (hit) {
-							const win = hit.split("|")[1] ?? "";
-							if (win) {
-								execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
-									stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
-								});
-								break;
-							}
-						}
-					} catch (e: any) {
-						if (i === 2) {
-							diagLog(`reg ERR ${String(e).slice(0, 150)}`);
-						} else {
-							await new Promise((r) => setTimeout(r, 800));
-						}
+			for (let i = 0; i < 3; i++) {
+				try {
+					tty = execSync(`ps -o tty= -p ${process.pid}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
+					const panes = execSync("rmux list-panes -a -F '#{pane_tty}|#{session_name}:#{window_name}|#{pane_pid}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).toString();
+					const hit = panes.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => l.split("|")[0].replace(/^\/dev\//, "") === tty);
+					if (hit) {
+						const parts = hit.split("|");
+						win = parts[1] ?? "";
+						panePid = parseInt(parts[2], 10) || null;
 					}
+					if (win && sessFile) {
+						execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
+							stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
+						});
+					}
+					break;
+				} catch (e: any) {
+					if (i === 2) {
+						diagLog(`reg ERR ${String(e).slice(0, 150)}`);
+					} else {
+						await new Promise((r) => setTimeout(r, 800));
+					}
+				}
+			}
+			// pid 注册表:终端 pi 也写(无 panePid),桌面端靠它直连会话身份
+			if (sessFile) {
+				const rtDir = path.join(getAgentDir(), "runtime");
+				try { fs.mkdirSync(rtDir, { recursive: true }); } catch {}
+				try {
+					fs.writeFileSync(path.join(rtDir, `${process.pid}.jsonl`), JSON.stringify({
+						type: "pi_runtime",
+						pid: process.pid,
+						panePid,
+						sessionPath: sessFile,
+						cwd: ctx.cwd || "",
+						startedAt: Date.now(),
+						tty,
+					}) + "\n", { encoding: "utf-8", mode: 0o600 });
+				} catch (e: any) {
+					diagLog(`runtime reg ERR ${String(e).slice(0, 120)}`);
 				}
 			}
 			g.__pi_subagent_sfile__ = sessFile;
