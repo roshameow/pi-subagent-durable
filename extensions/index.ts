@@ -1107,6 +1107,23 @@ function formatRunningTasks(list: { taskId: string; entry: AsyncTaskEntry }[]): 
 	}).join("\n");
 }
 
+// 按会话 id 找**真实**(非 subagent-task-* 镜像)的 session 文件路径。
+// pi --session <id> 会把 id 解析到先扫到的同 id 文件——镜像头 id 相同,
+// 可能被选中导致 getSessionFile 返回镜像路径(reload 后 desktop 归属断裂)。
+function findRealSessionPath(sessionId: string): string | null {
+	try {
+		const sessionsRoot = path.join(getAgentDir(), "sessions");
+		for (const dirName of fs.readdirSync(sessionsRoot)) {
+			const dir = path.join(sessionsRoot, dirName);
+			let files: string[] = [];
+			try { files = fs.readdirSync(dir); } catch { continue; }
+			const hit = files.find((f) => f.includes(sessionId) && !f.includes("subagent-task"));
+			if (hit) return path.join(dir, hit);
+		}
+	} catch {}
+	return null;
+}
+
 // 根据 sessionId 找到真实 session 文件，读取其 cwd（重连暂停/已结束的会话时用）
 function readSessionInfo(sessionId: string): { cwd?: string } | null {
 	try {
@@ -2140,11 +2157,17 @@ Return a concise summary of what you did and the key findings.`,
 		const sessionId = getTaskSessionId(taskId);
 		if (!sessionId) return `- ${taskId} (${entry.agent}): task session not in agent-logs yet, retry later`;
 		if (!(await killTask(taskId))) return `- ${taskId} (${entry.agent}): kill failed, session not resumed to avoid double-running`;
+		// resume 用**真实会话文件路径**而非 id:pi --session <id> 会把 id 解析到
+		// subagent-task-* 镜像(头 id 相同),导致 getSessionFile 返回镜像、
+		// 注册表/@pi_session 指向镜像 —— desktop 去重后真实会话拿不到
+		// rmux 归属,显示成 interrupted(实测 msqynf* → msqyudp* 的 reload)。
+		const realSessionPath = findRealSessionPath(sessionId);
+		const resumeTarget = realSessionPath || sessionId;
 		// 重新发现原 agent 配置（可能已更新），找不到则退回 _worker（恢复全部工具）
 		const cwd = entry.cwd || process.cwd();
 		const agents = discoverAgents(cwd, "both").agents;
 		const agentName = agents.some((x) => x.name === entry.agent) ? entry.agent : "_worker";
-		const newTaskId = await runAsyncSingleAgent(cwd, agents, agentName, prompt, ui, sessionId);
+		const newTaskId = await runAsyncSingleAgent(cwd, agents, agentName, prompt, ui, resumeTarget);
 		return newTaskId
 			? `- ${taskId} (${entry.agent}) killed → resumed session ${sessionId.slice(0, 8)}… as ${newTaskId}`
 			: `- ${taskId} (${entry.agent}): resume failed`;
