@@ -566,6 +566,19 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 	return items;
 }
 
+// 请求的 agent 属于项目级但当前 scope("user")没加载?提示模型用
+// agentScope="both" 让项目 agents 可见(项目 agents 是仓库控制的)。
+function projectAgentsHint(requested: string[], cwd: string, agents: AgentConfig[]): string {
+	try {
+		const all = discoverAgents(cwd, "both").agents;
+		const inProject = requested.filter((n) => n && all.some((a) => a.name === n && a.source === "project"));
+		if (inProject.length > 0) {
+			return ` "${inProject.join('", "')}" 是项目级 agent —— 传 agentScope="both" 才能使用。`;
+		}
+	} catch {}
+	return "";
+}
+
 async function mapWithConcurrencyLimit<TIn, TOut>(
 	items: TIn[],
 	concurrency: number,
@@ -1298,7 +1311,8 @@ export default function (pi: ExtensionAPI) {
 				// _worker 是动态构造的通用 worker（runAsyncSingleAgent 内支持），不在预注册列表里，需放行
 				if (agentName !== "_worker" && !agents.find((a) => a.name === agentName)) {
 					const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-					return { content: [{ type: "text", text: `Unknown agent: "${agentName}". Available: ${available}.` }], details: makeDetails("single")([]) };
+					const hint = projectAgentsHint([agentName], ctx.cwd, agents);
+					return { content: [{ type: "text", text: `Unknown agent: "${agentName}". Available: ${available}.${hint}` }], details: makeDetails("single")([]) };
 				}
 				const taskId = await runAsyncSingleAgent(ctx.cwd, agents, agentName, params.task!, ctx.ui);
 				const entry = asyncTasks.get(taskId);
@@ -1408,14 +1422,37 @@ export default function (pi: ExtensionAPI) {
 
 			// ── parallel 模式（默认异步后台执行）──
 			if (params.tasks && params.tasks.length > 0 && (params.async ?? true)) {
+				// 先校验所有 agent（与 single 模式一致）：无效 agent 直接报错，
+				// 不要假装提交（之前 runAsyncSingleAgent 返回空串时仍报
+				// “N task(s) submitted: scout ()”，worker 根本没启动）。
+				const unknown = params.tasks
+					.map((t) => t.agent)
+					.filter((a) => a && a !== "_worker" && !agents.some((x) => x.name === a));
+				if (unknown.length > 0) {
+					const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+					const hint = projectAgentsHint(unknown, ctx.cwd, agents);
+					return {
+						content: [{ type: "text", text: `Unknown agent: "${unknown.join('", "')}". Available: ${available}.${hint}` }],
+						details: makeDetails("parallel")(params.tasks.map(() => ({ agent: "", agentSource: "user" as const, task: "", exitCode: -1, messages: [], stderr: "", usage: ZERO_USAGE }))),
+					};
+				}
 				const ids: string[] = [];
+				const failures: string[] = [];
 				for (const t of params.tasks) {
 					const taskId = await runAsyncSingleAgent(ctx.cwd, agents, t.agent, t.task, ctx.ui);
-					ids.push(`${t.agent} (${taskId})`);
+					if (taskId) {
+						ids.push(`${t.agent} (${taskId})`);
+					} else {
+						failures.push(`"${t.agent}"`);
+					}
 				}
+				const text =
+					failures.length === 0
+						? `${ids.length} task(s) submitted: ${ids.join(", ")}. You will be notified when done.`
+						: `${ids.length} task(s) submitted${ids.length ? ": " + ids.join(", ") : ""}; ${failures.length} failed to start (${failures.join(", ")}).`;
 				if (sessionUI) sessionUI.notify(`⏳ 提交了 ${ids.length} 个后台任务`, "info");
 				return {
-					content: [{ type: "text", text: `${ids.length} task(s) submitted: ${ids.join(", ")}. You will be notified when done.` }],
+					content: [{ type: "text", text }],
 					details: makeDetails("parallel")(params.tasks.map(() => ({ agent: "", agentSource: "user" as const, task: "", exitCode: -1, messages: [], stderr: "", usage: ZERO_USAGE }))),
 				};
 			}
