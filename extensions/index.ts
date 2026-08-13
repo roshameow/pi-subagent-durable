@@ -833,7 +833,7 @@ const SubagentParams = Type.Object({
 	taskId: Type.Optional(Type.String({ description: "Check status of a previously submitted async task" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
+		Type.Boolean({ description: "Prompt before running project-local agents. Default: false.", default: false }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
@@ -1258,7 +1258,11 @@ export default function (pi: ExtensionAPI) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			// 项目级 agent 默认不弹确认(用户自己仓库的 agent,信任);
+			// 需要恢复确认时设 PI_SUBAGENT_CONFIRM_PROJECT=1。
+			const confirmProjectAgents =
+				(params.confirmProjectAgents ?? false) ||
+				process.env.PI_SUBAGENT_CONFIRM_PROJECT === "1";
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
