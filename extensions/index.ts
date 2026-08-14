@@ -973,7 +973,10 @@ async function killTask(taskId: string): Promise<boolean> {
 let _extCache: { at: number; map: Map<string, AsyncTaskEntry> } | null = null;
 function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 	const now = Date.now();
-	if (_extCache && now - _extCache.at < 3000) return _extCache.map;
+	// 15s 缓存:每个 pi 进程都独立轮询(spawn ps/rmux + readdir 全目录),
+	// 3s 时 10 个 pi 合计烧 ~170% CPU(实测 14 个 pi × 12-17%)。
+	// 15s 后单次开销不变但频率降 5 倍,widget 显示延迟 15s 可接受。
+	if (_extCache && now - _extCache.at < 15000) return _extCache.map;
 	const out = new Map<string, AsyncTaskEntry>();
 	const dir = getAgentLogDir();
 	let names: string[] = [];
