@@ -1235,6 +1235,24 @@ function fmtUsageShort(u?: TaskUsage): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	// pi.appendEntry 签名是 (customType: string, data?: T)。之前传单个对象当
+	// customType,生成畸形条目(customType=对象、data=undefined),TUI 渲染
+	// entry_appended 时抛错 → "appendEntry failed"。改传 ("agent", {key,value})
+	// 并重试一次;仍失败则把错误细节写 diag,结果本身已在 agent-log 不丢。
+	const persistResultEntry = (entry: { key: string; value: unknown }) => {
+		try {
+			pi.appendEntry("agent", entry);
+			return;
+		} catch (e: any) {
+			diagLog(`appendEntry ERR ${String(e instanceof Error ? e.message : e).slice(0, 200)}`);
+		}
+		try {
+			pi.appendEntry("agent", entry);
+		} catch (e: any) {
+			diagLog(`appendEntry retry ERR ${String(e instanceof Error ? e.message : e).slice(0, 200)}`);
+		}
+	};
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -2020,7 +2038,10 @@ Return a concise summary of what you did and the key findings.`,
 								: finalText
 									? finalText.slice(0, 500)
 									: "(no output)";
-							pi.appendEntry({ key: resultKey, value: { agent: agentName, task: taskText, exitCode: 0, output: finalText, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() } });
+							persistResultEntry({
+								key: resultKey,
+								value: { agent: agentName, task: taskText, exitCode: 0, output: finalText, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() },
+							});
 						} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
 						try {
 							const usageLine = usage && usage.turns > 0
@@ -2115,7 +2136,10 @@ Return a concise summary of what you did and the key findings.`,
 					: code === 0
 						? (finalText || "(no output)").slice(0, 500)
 						: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
-				pi.appendEntry({ key: resultKey, value: { agent: agentName, task: taskText, exitCode: code, output: finalText || stderr, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() } });
+				persistResultEntry({
+					key: resultKey,
+					value: { agent: agentName, task: taskText, exitCode: code, output: finalText || stderr, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() },
+				});
 			} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
 			if (code === 0) {
 				try {
