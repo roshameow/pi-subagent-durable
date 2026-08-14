@@ -1000,6 +1000,12 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 		// getAgentLogPath/asyncTasks 的 key 都按带前缀约定
 		const taskId = name.slice(0, -6);
 		if (asyncTasks.has(taskId)) continue; // 当前进程 spawn 的,内存里有
+		// 存活判断提前到读文件之前:112 个 task 日志累计 121MB,
+		// 每轮全量 readFileSync 是 CPU 大头(实测单次 496ms/pi/3s)。
+		// 只有活着的任务才需要读文件(通常 0-3 个)。
+		const winName = [...rmuxWindows].find((w) => w.includes(taskId));
+		const alive = winName ? true : psOut.includes(`${taskId}.jsonl`);
+		if (!alive) continue;
 		const logPath = path.join(dir, name);
 		let raw = "";
 		try { raw = fs.readFileSync(logPath, "utf-8"); } catch { continue; }
@@ -1009,9 +1015,6 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 		let lastType = "";
 		try { lastType = (JSON.parse(lines[lines.length - 1]).type || "") as string; } catch {}
 		if (lastType === "agent_end" || lastType === "agent_settled") continue;
-		const winName = [...rmuxWindows].find((w) => w.includes(taskId));
-		const alive = winName ? true : psOut.includes(`${taskId}.jsonl`);
-		if (!alive) continue;
 		// agent 名:窗口名 <agent>-task-<id>
 		let agent = "unknown";
 		if (winName) {
