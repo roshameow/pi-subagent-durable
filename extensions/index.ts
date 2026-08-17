@@ -721,7 +721,87 @@ Return a concise summary of what you did and the key findings.`,
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
 
-		const exitCode = await new Promise<number>((resolve) => {
+		// 从 JSON 事件流提取消息(rmux 路径读 filter 日志,spawn 路径读 stdout)
+		const processLine = (line: string) => {
+			if (!line.trim()) return;
+			let event: any;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				return;
+			}
+
+			if (event.type === "message_end" && event.message) {
+				const msg = event.message as Message;
+				currentResult.messages.push(msg);
+
+				if (msg.role === "assistant") {
+					currentResult.usage.turns++;
+					const usage = msg.usage;
+					if (usage) {
+						currentResult.usage.input += usage.input || 0;
+						currentResult.usage.output += usage.output || 0;
+						currentResult.usage.cacheRead += usage.cacheRead || 0;
+						currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+						currentResult.usage.cost += usage.cost?.total || 0;
+						currentResult.usage.contextTokens = usage.totalTokens || 0;
+					}
+					if (!currentResult.model && msg.model) currentResult.model = msg.model;
+					if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+					if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+				}
+				emitUpdate();
+			}
+
+			if (event.type === "tool_result_end" && event.message) {
+				currentResult.messages.push(event.message as Message);
+				emitUpdate();
+			}
+		};
+
+		const rmux = await getRmux();
+		let exitCode: number;
+		if (rmux) {
+			// ── RMUX 路径:子代理跑在 pi-agents pane(可 attach),同步等待完成 ──
+			const winName = makeRmuxWindowName(agentName, taskId);
+			const rmuxTarget = `${RMUX_SESSION_NAME}:${winName}.0`;
+			await rmux.cmd("new-session", "-d", "-s", RMUX_SESSION_NAME, "-n", "base").catch(() => {});
+			ensureJsonlFilterScript();
+			const filterExe = process.execPath;
+			const filterScript = getJsonlFilterPath();
+			const sessionPath = getSubagentSessionPath(taskId, cwd ?? defaultCwd);
+			try { fs.writeFileSync(sessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
+			const shellQ = (s: string) => s.match(/^[a-zA-Z0-9_./-]+$/) ? s : `'${s.replace(/'/g, "'\\''")}'`;
+			const piCommand = [process.execPath, process.argv[1]!, ...args].map(shellQ).join(" ");
+			const workdir = cwd ?? defaultCwd;
+			const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
+				`cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
+			if (r.returnCode !== 0) {
+				currentResult.stderr = `rmux new-window failed: ${String(r.stderr || r.stdout).slice(0, 300)}`;
+				exitCode = 1;
+			} else {
+				exitCode = await new Promise<number>((resolve) => {
+					const timer = setInterval(async () => {
+						let isDead = false;
+						try {
+							const panes = await rmux.cmd("list-panes", "-t", rmuxTarget);
+							isDead = panes.returnCode !== 0 || (panes.stdout?.includes("(dead)") ?? false);
+						} catch { isDead = true; }
+						if (isDead) {
+							clearInterval(timer);
+							// 读 filter 写入的 agent-log,重建 messages(供 {previous} 传递)
+							try {
+								const raw = fs.readFileSync(logPath, "utf-8");
+								for (const line of raw.split("\n")) processLine(line);
+							} catch {}
+							resolve(0);
+						}
+					}, 2000);
+				});
+			}
+		} else {
+			// ── 非 rmux 路径:spawn + stdio(保持原逻辑)──
+			exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
@@ -729,43 +809,6 @@ Return a concise summary of what you did and the key findings.`,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
 
 			proc.stdout.on("data", (data) => {
 				buffer += data.toString();
@@ -813,6 +856,7 @@ Return a concise summary of what you did and the key findings.`,
 				else signal.addEventListener("abort", killProc, { once: true });
 			}
 		});
+		}
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) throw new Error("Subagent was aborted");
