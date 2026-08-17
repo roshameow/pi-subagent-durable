@@ -666,6 +666,21 @@ Return a concise summary of what you did and the key findings.`,
 		};
 	}
 
+	// 与 runAsyncSingleAgent 一致:写 agent-log(首行 session 事件)——
+	// desktop 靠 agent-logs/task-*.jsonl 首行 id 认领 subagent;
+	// 缺了它 chain/single 子代理会被 desktop 当成普通 term 任务。
+	const taskId = generateTaskId();
+	const logPath = path.join(getAgentLogDir(), `${taskId}.jsonl`);
+	try {
+		fs.mkdirSync(getAgentLogDir(), { recursive: true });
+		const sessionId = crypto.randomUUID();
+		fs.writeFileSync(
+			logPath,
+			JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: new Date().toISOString(), cwd: cwd ?? defaultCwd }) + "\n",
+			{ encoding: "utf-8", mode: 0o600 },
+		);
+	} catch {}
+
 	const args: string[] = ["--mode", "json", "-p"];
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
@@ -756,7 +771,12 @@ Return a concise summary of what you did and the key findings.`,
 				buffer += data.toString();
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
+				for (const line of lines) {
+					if (line.trim()) {
+						try { fs.appendFileSync(logPath, line + "\n"); } catch {}
+					}
+					processLine(line);
+				}
 			});
 
 			proc.stderr.on("data", (data) => {
@@ -764,7 +784,16 @@ Return a concise summary of what you did and the key findings.`,
 			});
 
 			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
+				if (buffer.trim()) {
+					try { fs.appendFileSync(logPath, buffer + "\n"); } catch {}
+					processLine(buffer);
+				}
+				try {
+					fs.appendFileSync(
+						logPath,
+						JSON.stringify({ type: "agent_end", taskId, exitCode: code ?? 0, timestamp: new Date().toISOString() }) + "\n",
+					);
+				} catch {}
 				resolve(code ?? 0);
 			});
 
