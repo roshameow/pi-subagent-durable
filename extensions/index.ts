@@ -890,8 +890,8 @@ const ChainItem = Type.Object({
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
-	default: "user",
+	description: 'Which agent directories to use. Default: "both" (user + project-local agents). Pass "user" to restrict to user-level agents only.',
+	default: "both",
 });
 
 const SubagentParams = Type.Object({
@@ -1352,7 +1352,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "user";
+			const agentScope: AgentScope = params.agentScope ?? "both";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			// 项目级 agent 默认不弹确认(用户自己仓库的 agent,信任);
@@ -1666,7 +1666,7 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
+			const scope: AgentScope = args.agentScope ?? "both";
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
@@ -2574,7 +2574,7 @@ Return a concise summary of what you did and the key findings.`,
 	pi.registerCommand("agents", {
 		description: "List available subagents",
 		handler: async (args, ctx) => {
-			const scope: AgentScope = args === "all" ? "both" : "user";
+			const scope: AgentScope = args === "all" ? "both" : "both";
 			const discovery = discoverAgents(ctx.cwd, scope);
 			const lines = discovery.agents.map((a) =>
 				`  /agent:${a.name}  ${a.description}${a.source === "project" ? " (project)" : ""}`
