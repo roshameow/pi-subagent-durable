@@ -774,8 +774,9 @@ Return a concise summary of what you did and the key findings.`,
 			const shellQ = (s: string) => s.match(/^[a-zA-Z0-9_./-]+$/) ? s : `'${s.replace(/'/g, "'\\''")}'`;
 			const piCommand = [process.execPath, process.argv[1]!, ...args].map(shellQ).join(" ");
 			const workdir = cwd ?? defaultCwd;
+			// 注入 PI_SUBAGENT_TASK_ID（agent-notify 定向路由用：每个 subagent 独立通知目录）
 			const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-				`cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
+				`export PI_SUBAGENT_TASK_ID=${shellQ(taskId)} && cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
 			if (r.returnCode !== 0) {
 				currentResult.stderr = `rmux new-window failed: ${String(r.stderr || r.stdout).slice(0, 300)}`;
 				exitCode = 1;
@@ -2053,7 +2054,7 @@ Return a concise summary of what you did and the key findings.`,
 				const sessionPath = getSubagentSessionPath(taskId, cwd);
 				try { fs.writeFileSync(sessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
 				const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-					`cd ${cwd} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${logPath}`);
+					`export PI_SUBAGENT_TASK_ID=${shellQuote(taskId)} && cd ${cwd} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${logPath}`);
 
 				if (r.returnCode === 0) {
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
@@ -2145,7 +2146,7 @@ Return a concise summary of what you did and the key findings.`,
 		}
 
 		// ── fallback: spawn 方式 ──
-		const proc = spawn(process.execPath, [process.argv[1]!, ...piArgs], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+		const proc = spawn(process.execPath, [process.argv[1]!, ...piArgs], { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_SUBAGENT_TASK_ID: taskId } });
 		const fbSessionPath = getSubagentSessionPath(taskId, cwd);
 		try { fs.writeFileSync(fbSessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
 
