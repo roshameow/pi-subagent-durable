@@ -199,7 +199,7 @@ Before acting and again before completion/interruption, reread the nearest repos
 
 [WORKER TERMINATION GATE]
 After any submission or platform-status notification, re-query the authoritative item status before waiting. If submission is accepted (submitted/pending_claim/in_review, with no active repair), immediately persist checkpoint + verified experience, give the final summary, and EXIT this worker. Do not keep the model alive merely because a review watcher remains; watchers are separate processes. Continue only when the item is actually in repair or there is an explicit unresolved action.
-When launching a watcher, pass the current PI_SUBAGENT_TASK_ID explicitly if the script supports it; never reuse a task ID from an old watcher.
+For an unresolved action that depends on an external state change, do not exit and do not block a foreground tool with sleep/polling. Start one bounded external watcher with the current PI_SUBAGENT_TASK_ID and exact item, verify its PID/marker, call arm_notification_wait, then finish the current turn; agent-notify keeps this process alive at agent_end and resumes this same session on the directed event. Never reuse a task ID from an old watcher.
 `;
 
 function workerTaskText(agentName: string, task: string): string {

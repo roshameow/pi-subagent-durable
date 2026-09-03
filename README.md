@@ -50,6 +50,8 @@ pi -e ./pi-subagent-durable
 
 Active workers are mirrored to `/tmp/pi-agent-notify/.active-workers.json`. Settled worker logs are pruned on registry mutation, and normal sync/async completion unregisters the task. If a task prompt states `itemId=<six digits>`, starting a second active worker for that same item and cwd is rejected. Put the target itemId near the beginning of each worker prompt; this gate supplements, not replaces, project-local lifecycle rules.
 
+An unfinished worker waiting for an external state change must remain active rather than producing `agent_settled`. With `pi-agent-notify`, it starts one bounded detached watcher, calls `arm_notification_wait`, and finishes its model turn. The notify extension holds the child's `agent_end`, so the process and registry ownership stay live without a foreground sleep/poll script; a directed `notify_agent.py --item <ownedItem> --to <taskId>` event queues the next run in the same session. Delivered/terminal workers do not arm a lease and exit normally.
+
 The main agent can do all of this from plain language, e.g.:
 
 > Reconnect the subagent working on task X — I just updated the MCP server.
