@@ -105,7 +105,22 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 
 	if (scope === "both") {
 		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of projectAgents) {
+			const base = agentMap.get(agent.name);
+			// _worker is intentionally layered: keep the generic user worker and
+			// append the nearest project's domain instructions. Other named agents
+			// retain the historical project-overrides-user behavior.
+			if (agent.name === "_worker" && base) {
+				agentMap.set(agent.name, {
+					...base,
+					systemPrompt: `${base.systemPrompt.trim()}\n\n--- Project worker overlay (${agent.filePath}) ---\n${agent.systemPrompt.trim()}`,
+					source: "project",
+					filePath: agent.filePath,
+				});
+			} else {
+				agentMap.set(agent.name, agent);
+			}
+		}
 	} else if (scope === "user") {
 		for (const agent of userAgents) agentMap.set(agent.name, agent);
 	} else {

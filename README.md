@@ -46,6 +46,10 @@ pi -e ./pi-subagent-durable
 | `subagent_reload` | **Kill + reconnect** a running subagent without losing context (resumed from its saved session, picks up freshly loaded tools/extensions/MCP). Also resumes paused/finished sessions directly. Match by `taskId` / `agent` / `sessionId`; none given = all. |
 | `subagent_stop` | Kill a running subagent without resuming (session file preserved for later). |
 
+### External worker registry and item gate
+
+Active workers are mirrored to `/tmp/pi-agent-notify/.active-workers.json`. Settled worker logs are pruned on registry mutation, and normal sync/async completion unregisters the task. If a task prompt states `itemId=<six digits>`, starting a second active worker for that same item and cwd is rejected. Put the target itemId near the beginning of each worker prompt; this gate supplements, not replaces, project-local lifecycle rules.
+
 The main agent can do all of this from plain language, e.g.:
 
 > Reconnect the subagent working on task X — I just updated the MCP server.

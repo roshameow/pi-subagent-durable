@@ -24,6 +24,7 @@ import {
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
+	parseFrontmatter,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, type Focusable, matchesKey } from "@earendil-works/pi-tui";
@@ -87,6 +88,149 @@ function getAgentLogDir(): string {
 
 function getAgentLogPath(taskId: string): string {
 	return path.join(getAgentLogDir(), `${taskId}.jsonl`);
+}
+
+// Shared registry used by external watcher scripts. A stale --to target must
+// never fail silently: notify_agent.py uses this registry to fall back to the
+// main session when the worker has already been replaced or exited.
+function getWorkerRegistryPath(): string {
+	return path.join(process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify", ".active-workers.json");
+}
+
+function workerLogIsSettled(taskId: string): boolean {
+	try {
+		const file = getAgentLogPath(taskId);
+		const stat = fs.statSync(file);
+		const size = Math.min(stat.size, 65536);
+		const fd = fs.openSync(file, "r");
+		const buf = Buffer.alloc(size);
+		try { fs.readSync(fd, buf, 0, size, Math.max(0, stat.size - size)); }
+		finally { fs.closeSync(fd); }
+		const lines = buf.toString("utf8").split(/\r?\n/).filter(Boolean);
+		for (let i = lines.length - 1; i >= 0; i--) {
+			try { return JSON.parse(lines[i])?.type === "agent_settled"; }
+			catch { /* skip a partial line at the tail boundary */ }
+		}
+	} catch { /* log may not exist yet */ }
+	return false;
+}
+
+function mutateWorkerRegistry(taskId: string, record?: Record<string, unknown>): void {
+	try {
+		const registry = getWorkerRegistryPath();
+		fs.mkdirSync(path.dirname(registry), { recursive: true });
+		let data: Record<string, any> = { version: 1, workers: {} };
+		try { data = JSON.parse(fs.readFileSync(registry, "utf-8")); } catch {}
+		if (!data || typeof data !== "object") data = { version: 1, workers: {} };
+		if (!data.workers || typeof data.workers !== "object") data.workers = {};
+		// Remove registrations owned by a dead parent runtime. Workers launched
+		// from an older/reloaded main session must fall back to the main session,
+		// not receive events in a directory nobody consumes.
+		for (const [id, old] of Object.entries(data.workers)) {
+			const ownerPid = Number((old as any)?.pid);
+			if (workerLogIsSettled(id)) {
+				delete data.workers[id];
+				continue;
+			}
+			if (ownerPid && ownerPid !== process.pid) {
+				try { process.kill(ownerPid, 0); } catch { delete data.workers[id]; }
+			}
+		}
+		if (record) data.workers[taskId] = record;
+		else delete data.workers[taskId];
+		const tmp = `${registry}.${process.pid}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify(data), { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(tmp, registry);
+	} catch (e) {
+		// diagLog is declared later; defer logging to stderr here.
+		console.warn(`[subagent] worker registry update failed ${taskId}:`, e);
+	}
+}
+
+function extractItemIds(taskText?: string): string[] {
+	const text = taskText || "";
+	const explicit: string[] = [];
+	for (const re of [/(?:item(?:Id)?|题目|活动)[\s:=：#-]*(\d{6})/gi, /\/activity\/(\d{6})(?:\b|\/)/g]) {
+		for (const m of text.matchAll(re)) explicit.push(m[1]);
+	}
+	if (explicit.length) return [...new Set(explicit)];
+	const bare = [...new Set(text.match(/\b\d{6}\b/g) || [])];
+	// 兼容历史 prompt：约定任务开头第一个六位数就是目标 item；新任务应显式写 itemId。
+	return bare.length ? [bare[0]] : [];
+}
+
+function assertNoWorkerItemCollision(taskId: string, cwd: string, itemIds: string[]): void {
+	if (itemIds.length === 0) return;
+	try {
+		const data = JSON.parse(fs.readFileSync(getWorkerRegistryPath(), "utf-8"));
+		for (const [id, old] of Object.entries(data?.workers || {})) {
+			if (id === taskId || workerLogIsSettled(id)) continue;
+			const rec = old as any;
+			if (path.resolve(rec?.cwd || "") !== path.resolve(cwd)) continue;
+			const overlap = itemIds.filter((x) => Array.isArray(rec?.itemIds) && rec.itemIds.includes(x));
+			if (overlap.length) throw new Error(`worker item collision: ${overlap.join(",")} already owned by ${id}`);
+		}
+	} catch (e: any) {
+		if (String(e?.message || e).includes("worker item collision")) throw e;
+		// 缺失/旧版 registry 不阻断首次迁移；写入后后续创建即可执行硬门禁。
+	}
+}
+
+function registerWorker(taskId: string, cwd: string, taskText?: string): void {
+	const itemIds = extractItemIds(taskText);
+	assertNoWorkerItemCollision(taskId, cwd, itemIds);
+	mutateWorkerRegistry(taskId, {
+		taskId, pid: process.pid, cwd, itemIds,
+		startedAt: new Date().toISOString(),
+	});
+}
+
+function unregisterWorker(taskId: string): void {
+	mutateWorkerRegistry(taskId);
+}
+
+// Keep a small, domain-neutral closeout reminder visible in every task prompt.
+// Domain rules belong to the nearest project's layered worker instructions and
+// the repository guide, not in this reusable extension package.
+const WORKER_PERSISTENCE_REMINDER = `
+
+[WORKER CLOSEOUT]
+Before acting and again before completion/interruption, reread the nearest repository-local worker instructions (especially .pi/agents/_worker.md) and the guides they reference. Follow their artifact/experience persistence rules, persist deliverables outside /tmp, and report every changed file. If there is no new verified experience, say so explicitly; do not invent one.
+
+[WORKER TERMINATION GATE]
+After any submission or platform-status notification, re-query the authoritative item status before waiting. If submission is accepted (submitted/pending_claim/in_review, with no active repair), immediately persist checkpoint + verified experience, give the final summary, and EXIT this worker. Do not keep the model alive merely because a review watcher remains; watchers are separate processes. Continue only when the item is actually in repair or there is an explicit unresolved action.
+When launching a watcher, pass the current PI_SUBAGENT_TASK_ID explicitly if the script supports it; never reuse a task ID from an old watcher.
+`;
+
+function workerTaskText(agentName: string, task: string): string {
+	return agentName === "_worker" ? `${task}${WORKER_PERSISTENCE_REMINDER}` : task;
+}
+
+function fallbackWorkerAgent(cwd?: string): AgentConfig {
+	// This path is used by resume callers that pass agents=[]. Re-discover first
+	// so a project's _worker overlay is still applied to the generic worker.
+	if (cwd) {
+		const projectWorker = discoverAgents(cwd, "both").agents.find((a) => a.name === "_worker");
+		if (projectWorker) return projectWorker;
+	}
+	const filePath = path.join(getAgentDir(), "agents", "_worker.md");
+	try {
+		const raw = fs.readFileSync(filePath, "utf-8");
+		const parsed = parseFrontmatter<Record<string, string>>(raw);
+		if (parsed.frontmatter.name === "_worker" && parsed.frontmatter.description) {
+			return {
+				name: "_worker", description: parsed.frontmatter.description,
+				tools: parsed.frontmatter.tools?.split(",").map((x) => x.trim()).filter(Boolean),
+				model: parsed.frontmatter.model, systemPrompt: parsed.body,
+				source: "user", filePath,
+			};
+		}
+	} catch {}
+	return {
+		name: "_worker", description: "Generic worker with full capabilities",
+		systemPrompt: `You are a general-purpose coding/research agent. Complete the task thoroughly.\n${WORKER_PERSISTENCE_REMINDER}`,
+		source: "user", filePath,
+	};
 }
 
 function makeRmuxWindowName(agentName: string, taskId: string): string {
@@ -641,15 +785,7 @@ async function runSingleAgent(
 	let agent = agents.find((a) => a.name === agentName);
 	// _worker: 通用 worker，不依赖预注册 agent（与 runAsyncSingleAgent 保持一致）
 	if (!agent && agentName === "_worker") {
-		agent = {
-			name: "_worker",
-			description: "Generic worker with full capabilities",
-			systemPrompt: `You are a general-purpose coding/research agent. You have access to all tools.
-Complete the task thoroughly. Use the full context window - read files, run commands, analyze code.
-Return a concise summary of what you did and the key findings.`,
-			source: "user",
-			filePath: "",
-		};
+		agent = fallbackWorkerAgent(cwd ?? defaultCwd);
 	}
 
 	if (!agent) {
@@ -670,6 +806,7 @@ Return a concise summary of what you did and the key findings.`,
 	// desktop 靠 agent-logs/task-*.jsonl 首行 id 认领 subagent;
 	// 缺了它 chain/single 子代理会被 desktop 当成普通 term 任务。
 	const taskId = generateTaskId();
+	registerWorker(taskId, cwd ?? defaultCwd, task);
 	const logPath = path.join(getAgentLogDir(), `${taskId}.jsonl`);
 	try {
 		fs.mkdirSync(getAgentLogDir(), { recursive: true });
@@ -718,7 +855,7 @@ Return a concise summary of what you did and the key findings.`,
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
+		args.push(`Task: ${workerTaskText(agentName, task)}`);
 		let wasAborted = false;
 
 		// 从 JSON 事件流提取消息(rmux 路径读 filter 日志,spawn 路径读 stdout)
@@ -863,6 +1000,7 @@ Return a concise summary of what you did and the key findings.`,
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
+		unregisterWorker(taskId);
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -1996,19 +2134,12 @@ export default function (pi: ExtensionAPI) {
 		let agent = agents.find((a) => a.name === agentName);
 		// _worker: 通用 worker，不依赖预注册 agent
 		if (!agent && agentName === "_worker") {
-			agent = {
-				name: "_worker",
-				description: "Generic worker with full capabilities",
-				systemPrompt: `You are a general-purpose coding/research agent. You have access to all tools.
-Complete the task thoroughly. Use the full context window - read files, run commands, analyze code.
-Return a concise summary of what you did and the key findings.`,
-				source: "user",
-				filePath: "",
-			};
+			agent = fallbackWorkerAgent(cwd);
 		}
 		if (!agent) return "";
 
 		const taskId = generateTaskId();
+		registerWorker(taskId, cwd, taskText);
 
 		// 构建 pi 参数
 		const piArgs: string[] = ["--mode", "json", "-p"];
@@ -2022,7 +2153,7 @@ Return a concise summary of what you did and the key findings.`,
 			fs.writeFileSync(tmpPromptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 			piArgs.push("--append-system-prompt", tmpPromptPath);
 		}
-		piArgs.push(`Task: ${taskText}`);
+		piArgs.push(`Task: ${workerTaskText(agentName, taskText)}`);
 
 		// 输出日志文件（给 /agent-live 看）
 		const logPath = path.join(getAgentLogDir(), `${taskId}.jsonl`);
@@ -2066,6 +2197,7 @@ Return a concise summary of what you did and the key findings.`,
 					});
 
 					const cleanup = () => {
+						unregisterWorker(taskId);
 						asyncTasks.delete(taskId);
 						if (tmpPromptPath) { try { fs.unlinkSync(tmpPromptPath); } catch {} }
 					};
@@ -2163,6 +2295,7 @@ Return a concise summary of what you did and the key findings.`,
 		proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
 
 		const cleanupFallback = () => {
+			unregisterWorker(taskId);
 			asyncTasks.delete(taskId);
 			if (tmpPromptPath) { try { fs.unlinkSync(tmpPromptPath); } catch {} }
 		};
@@ -2247,8 +2380,15 @@ Return a concise summary of what you did and the key findings.`,
 
 		updateWidget();
 
-		// 安全兜底：60 秒后自动清理
-		setTimeout(cleanupFallback, 60000);
+		// 不要按固定时长清理：长任务可能正常运行数小时，提前删除会使
+		// registry 失效并把后续定向通知投递到主 session。仅在进程已结束但
+		// close 事件异常丢失时兜底清理，活跃进程永不被这个 timer 删除。
+		const orphanCleanup = setTimeout(() => {
+			if (!asyncTasks.has(taskId)) return;
+			if (proc.exitCode !== null || proc.killed) cleanupFallback();
+			else console.warn(`[subagent] task ${taskId} still active after 60s; retaining it`);
+		}, 60000);
+		(orphanCleanup as any).unref?.();
 
 		return taskId;
 	};
@@ -2619,6 +2759,11 @@ Return a concise summary of what you did and the key findings.`,
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
+		// reload 后 asyncTasks 保存在 globalThis，重新把仍存活的任务注册给
+		// watcher 路由；否则新模块会把它们误判成 stale target。
+		for (const [id, entry] of asyncTasks) {
+			registerWorker(id, entry.cwd || (ctx as any).cwd || process.cwd(), entry.task);
+		}
 		// reload 安全:把会话状态存到 globalThis,新模块加载时恢复
 		const g = globalThis as any;
 		g.__pi_subagent_ui__ = ctx.ui;
