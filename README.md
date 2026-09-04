@@ -73,7 +73,7 @@ model: claude-haiku-4-5    # optional, defaults to the main provider
 System prompt for the agent goes here.
 ```
 
-Changes to agent definitions are picked up on the next call (no reload needed).
+Changes to agent definitions are picked up on the next call (no reload needed). When an agent omits `model`, the child now inherits the dispatching main session's active `provider/model` and thinking level; an explicit agent `model` remains pinned.
 
 ### Commands
 
@@ -134,6 +134,8 @@ pi (main session)
 
 ## Recent fixes
 
+- **Inherited model instead of exhausted global default** — an unpinned agent previously launched without `--model`, so the child silently used `settings.json`'s default model even when the parent was running a different healthy model. This could make every subagent immediately end with `stopReason=error` (for example a 429 weekly usage limit). Unpinned single/parallel/chain/resumed agents now inherit the parent model and thinking level.
+- **Exact provider diagnostics + named-agent resume** — provider `errorMessage` is included in completion notifications instead of a generic “last turn interrupted” message. New task logs persist agent identity, so `subagent_reload` resumes the same named agent rather than degrading it to `_worker`.
 - **Completion notification when a subagent ends with empty text** — previously the completion notification was only sent when the parsed `finalText` was non-empty, and `finalText` came from the *last* `message_end` only. A subagent that finished with a tool-call-only / empty assistant message (common after polling an async backtest) produced empty text, so the main agent never got notified. Fixed by extracting the last **non-empty** assistant text across all `message_end` events and always notifying on success (with a fallback message when there is no text).
 - **Completion notify without `deliverAs` threw during streaming** — `pi.sendUserMessage()` during an active main turn required a `streamingBehavior`; results were dropped and an extension error surfaced. Now uses `{ deliverAs: "steer" }` so results are queued and delivered after the current turn's tool calls finish.
 

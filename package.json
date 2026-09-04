@@ -18,7 +18,7 @@
     "url": "https://github.com/yourname/pi-subagent-durable.git"
   },
   "scripts": {
-    "check": "npx esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --external:@rmux/* --external:typebox --outfile=/tmp/pi-subagent-durable-check.mjs && node tests/identity.test.mjs"
+    "check": "npx esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --external:@rmux/* --external:typebox --outfile=/tmp/pi-subagent-durable-check.mjs && node tests/identity.test.mjs && node tests/dispatch.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

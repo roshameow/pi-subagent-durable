@@ -16,7 +16,7 @@ import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -31,6 +31,7 @@ import { Container, Markdown, Spacer, Text, type Focusable, matchesKey } from "@
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { extractItemIds } from "./identity.mjs";
+import { resolveDispatchConfig } from "./dispatch.mjs";
 
 // ── RMUX integration ──
 const RMUX_SESSION_NAME = "pi-agents";
@@ -89,6 +90,28 @@ function getAgentLogDir(): string {
 
 function getAgentLogPath(taskId: string): string {
 	return path.join(getAgentLogDir(), `${taskId}.jsonl`);
+}
+
+function appendTaskMetadata(
+	logPath: string,
+	taskId: string,
+	agent: string,
+	task: string,
+	cwd: string,
+): void {
+	try {
+		fs.appendFileSync(
+			logPath,
+			JSON.stringify({
+				type: "pi_subagent_task",
+				taskId,
+				agent,
+				task,
+				cwd,
+				timestamp: new Date().toISOString(),
+			}) + "\n",
+		);
+	} catch {}
 }
 
 // Shared registry used by external watcher scripts. A stale --to target must
@@ -260,6 +283,20 @@ function extractStopReason(raw: string): string | undefined {
 			const event = JSON.parse(line);
 			if (event.type === "message_end" && event.message?.role === "assistant") {
 				if (event.message.stopReason) last = event.message.stopReason;
+			}
+		} catch {}
+	}
+	return last;
+}
+
+function extractErrorMessage(raw: string): string | undefined {
+	let last: string | undefined;
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const event = JSON.parse(line);
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				if (event.message.errorMessage) last = String(event.message.errorMessage);
 			}
 		} catch {}
 	}
@@ -764,8 +801,21 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+interface DispatchDefaults {
+	model?: string;
+	thinkingLevel?: ThinkingLevel;
+}
+
+function dispatchDefaultsFromContext(ctx: any): DispatchDefaults {
+	return {
+		model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+		thinkingLevel: ctx.thinkingLevel,
+	};
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
+	dispatchDefaults: DispatchDefaults,
 	agents: AgentConfig[],
 	agentName: string,
 	task: string,
@@ -810,9 +860,12 @@ async function runSingleAgent(
 			{ encoding: "utf-8", mode: 0o600 },
 		);
 	} catch {}
+	appendTaskMetadata(logPath, taskId, agentName, task, cwd ?? defaultCwd);
 
 	const args: string[] = ["--mode", "json", "-p"];
-	if (agent.model) args.push("--model", agent.model);
+	const dispatch = resolveDispatchConfig(agent.model, dispatchDefaults);
+	if (dispatch.model) args.push("--model", dispatch.model);
+	if (dispatch.thinkingLevel) args.push("--thinking", dispatch.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 	if (fs.existsSync(path.join(cwd ?? defaultCwd, '.mcp.json'))) args.push('--mcp-config', path.join(cwd ?? defaultCwd, '.mcp.json'));
 
@@ -827,7 +880,7 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: dispatch.model,
 		step,
 	};
 
@@ -1105,6 +1158,31 @@ function getTaskSessionId(taskId: string): string | null {
 			if (!l.trim()) continue;
 			const ev = JSON.parse(l);
 			if (ev.type === "session" && ev.id) return ev.id;
+		}
+	} catch {}
+	return null;
+}
+
+function getTaskMetadata(taskId: string): { agent?: string; task?: string; cwd?: string } | null {
+	try {
+		const raw = fs.readFileSync(getAgentLogPath(taskId), "utf-8");
+		for (const line of raw.split("\n")) {
+			if (!line.trim()) continue;
+			const event = JSON.parse(line);
+			if (event.type === "pi_subagent_task") {
+				return { agent: event.agent, task: event.task, cwd: event.cwd };
+			}
+		}
+	} catch {}
+	return null;
+}
+
+function findTaskIdBySessionId(sessionId: string): string | null {
+	try {
+		for (const file of fs.readdirSync(getAgentLogDir())) {
+			if (!file.startsWith("task-") || !file.endsWith(".jsonl")) continue;
+			const taskId = file.slice(0, -6);
+			if (getTaskSessionId(taskId) === sessionId) return taskId;
 		}
 	} catch {}
 	return null;
@@ -1512,6 +1590,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "both";
+			const dispatchDefaults = dispatchDefaultsFromContext(ctx);
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			// 项目级 agent 默认不弹确认(用户自己仓库的 agent,信任);
@@ -1591,7 +1670,7 @@ export default function (pi: ExtensionAPI) {
 					const hint = projectAgentsHint([agentName], ctx.cwd, agents);
 					return { content: [{ type: "text", text: `Unknown agent: "${agentName}". Available: ${available}.${hint}` }], details: makeDetails("single")([]) };
 				}
-				const taskId = await runAsyncSingleAgent(ctx.cwd, agents, agentName, params.task!, ctx.ui);
+				const taskId = await runAsyncSingleAgent(ctx.cwd, dispatchDefaults, agents, agentName, params.task!, ctx.ui);
 				const entry = asyncTasks.get(taskId);
 				const rmuxLine = entry?.useRmux && entry?.rmuxAttachCmd
 					? `\nAttach: ${entry.rmuxAttachCmd}`
@@ -1606,7 +1685,7 @@ export default function (pi: ExtensionAPI) {
 
 			// ── auto 模式（不指定 agent，自动用通用 worker）──
 			if (hasAuto) {
-				const taskId = await runAsyncSingleAgent(ctx.cwd, agents, "_worker", params.task!, ctx.ui);
+				const taskId = await runAsyncSingleAgent(ctx.cwd, dispatchDefaults, agents, "_worker", params.task!, ctx.ui);
 				const entry = asyncTasks.get(taskId);
 				const rmuxLine = entry?.useRmux && entry?.rmuxAttachCmd
 					? `\nAttach: ${entry.rmuxAttachCmd}`
@@ -1669,6 +1748,7 @@ export default function (pi: ExtensionAPI) {
 
 					const result = await runSingleAgent(
 						ctx.cwd,
+						dispatchDefaults,
 						agents,
 						step.agent,
 						taskWithContext,
@@ -1716,7 +1796,7 @@ export default function (pi: ExtensionAPI) {
 				const ids: string[] = [];
 				const failures: string[] = [];
 				for (const t of params.tasks) {
-					const taskId = await runAsyncSingleAgent(ctx.cwd, agents, t.agent, t.task, ctx.ui);
+					const taskId = await runAsyncSingleAgent(ctx.cwd, dispatchDefaults, agents, t.agent, t.task, ctx.ui);
 					if (taskId) {
 						ids.push(`${t.agent} (${taskId})`);
 					} else {
@@ -1778,6 +1858,7 @@ export default function (pi: ExtensionAPI) {
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
+						dispatchDefaults,
 						agents,
 						t.agent,
 						t.task,
@@ -2145,6 +2226,7 @@ export default function (pi: ExtensionAPI) {
 	// 优先使用 RMUX pane（持久化 + 可见），fallback 到 spawn
 	const runAsyncSingleAgent = async (
 		cwd: string,
+		dispatchDefaults: DispatchDefaults,
 		agents: AgentConfig[],
 		agentName: string,
 		taskText: string,
@@ -2167,7 +2249,9 @@ export default function (pi: ExtensionAPI) {
 		// 构建 pi 参数
 		const piArgs: string[] = ["--mode", "json", "-p"];
 		if (resumeSessionId) piArgs.push("--session", resumeSessionId);
-		if (agent.model) piArgs.push("--model", agent.model);
+		const dispatch = resolveDispatchConfig(agent.model, dispatchDefaults);
+		if (dispatch.model) piArgs.push("--model", dispatch.model);
+		if (dispatch.thinkingLevel) piArgs.push("--thinking", dispatch.thinkingLevel);
 		if (agent.tools && agent.tools.length > 0) piArgs.push("--tools", agent.tools.join(","));
 		if (fs.existsSync(path.join(cwd, '.mcp.json'))) piArgs.push('--mcp-config', path.join(cwd, '.mcp.json'));
 		let tmpPromptPath: string | null = null;
@@ -2184,6 +2268,7 @@ export default function (pi: ExtensionAPI) {
 			fs.mkdirSync(getAgentLogDir(), { recursive: true });
 			fs.writeFileSync(logPath, "", { encoding: "utf-8", mode: 0o600 });
 		} catch {}
+		appendTaskMetadata(logPath, taskId, agentName, taskText, cwd);
 
 		// shell 安全地拼接参数，处理空格和引号
 		const shellQuote = (s: string) => s.match(/^[a-zA-Z0-9_./-]+$/) ? s : `'${s.replace(/'/g, "'\\''")}'`;
@@ -2263,13 +2348,14 @@ export default function (pi: ExtensionAPI) {
 						try { rawOutput = fs.readFileSync(logPath, "utf-8"); } catch {}
 						const finalText = extractAssistantFinalText(rawOutput);
 						const stopReason = extractStopReason(rawOutput);
+						const errorMessage = extractErrorMessage(rawOutput);
 
 						cleanup();
 						updateWidget();
 						try {
 							const resultKey = `agent:${agentName}:${taskId}`;
 							const summary = stopReason === "error"
-								? `interrupted (${stopReason}): ${finalText.slice(0, 300) || "model/provider error, no text output"}`
+								? `interrupted (${stopReason}): ${(errorMessage || finalText || "model/provider error, no text output").slice(0, 500)}`
 								: finalText
 									? finalText.slice(0, 500)
 									: "(no output)";
@@ -2285,7 +2371,7 @@ export default function (pi: ExtensionAPI) {
 							const body = finalText
 								? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
 								: stopReason === "error"
-									? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：最后一轮被模型/provider 错误打断（stopReason=error），无文本输出。可用 subagent_reload 恢复该任务继续。`
+									? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：${(errorMessage || "model/provider error").slice(0, 1200)}\n可用 subagent_reload 恢复；恢复时会继承当前主会话模型。`
 									: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
 							sendCompletionToCurrentSession(pi, body);
 						} catch (e) { console.warn("[subagent] completion notify failed:", e); }
@@ -2363,12 +2449,13 @@ export default function (pi: ExtensionAPI) {
 			const usage = asyncTasks.get(taskId)?.usage;
 			const finalText = extractAssistantFinalText(rawStdout);
 			const stopReason = extractStopReason(rawStdout);
+			const errorMessage = extractErrorMessage(rawStdout);
 			cleanupFallback();
 			updateWidget();
 			try {
 				const resultKey = `agent:${agentName}:${taskId}`;
 				const summary = stopReason === "error"
-					? `interrupted (${stopReason}): ${finalText.slice(0, 300) || "model/provider error, no text output"}`
+					? `interrupted (${stopReason}): ${(errorMessage || finalText || "model/provider error, no text output").slice(0, 500)}`
 					: code === 0
 						? (finalText || "(no output)").slice(0, 500)
 						: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
@@ -2385,7 +2472,7 @@ export default function (pi: ExtensionAPI) {
 					const body = finalText
 						? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
 						: stopReason === "error"
-							? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：最后一轮被模型/provider 错误打断（stopReason=error），无文本输出。可用 subagent_reload 恢复该任务继续。`
+							? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：${(errorMessage || "model/provider error").slice(0, 1200)}\n可用 subagent_reload 恢复；恢复时会继承当前主会话模型。`
 							: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
 					sendCompletionToCurrentSession(pi, body);
 				} catch (e) { console.warn("[subagent] completion notify failed:", e); }
@@ -2417,7 +2504,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// 重连一个运行中的任务：kill 后用 --session 恢复上下文，重新加载工具/扩展/MCP
-	const reloadTask = async (taskId: string, prompt: string, ui: any): Promise<string> => {
+	const reloadTask = async (
+		taskId: string,
+		prompt: string,
+		ui: any,
+		dispatchDefaults: DispatchDefaults,
+	): Promise<string> => {
 		const entry = asyncTasks.get(taskId) || discoverExternalTasks().get(taskId);
 		if (!entry) return `- ${taskId}: task not found`;
 		// resume 的必须是任务**自己**的会话:agent-log 里第一个 session 事件
@@ -2438,18 +2530,42 @@ export default function (pi: ExtensionAPI) {
 		const cwd = entry.cwd || process.cwd();
 		const agents = discoverAgents(cwd, "both").agents;
 		const agentName = agents.some((x) => x.name === entry.agent) ? entry.agent : "_worker";
-		const newTaskId = await runAsyncSingleAgent(cwd, agents, agentName, prompt, ui, resumeTarget, entry.task);
+		const newTaskId = await runAsyncSingleAgent(
+			cwd, dispatchDefaults, agents, agentName, prompt, ui, resumeTarget, entry.task
+		);
 		return newTaskId
 			? `- ${taskId} (${entry.agent}) killed → resumed session ${sessionId.slice(0, 8)}… as ${newTaskId}`
 			: `- ${taskId} (${entry.agent}): resume failed`;
 	};
 
 	// 直接重连一个已暂停/已结束的 session（无需 kill，因为没在跑）
-	const resumeSession = async (sessionId: string, prompt: string, ui: any, preferredCwd?: string): Promise<string> => {
+	const resumeSession = async (
+		sessionId: string,
+		prompt: string,
+		ui: any,
+		dispatchDefaults: DispatchDefaults,
+		preferredCwd?: string,
+		preferredAgent?: string,
+	): Promise<string> => {
+		const sourceTaskId = findTaskIdBySessionId(sessionId);
+		const metadata = sourceTaskId ? getTaskMetadata(sourceTaskId) : null;
 		const info = readSessionInfo(sessionId);
-		const cwd = preferredCwd || info?.cwd || process.cwd();
+		const cwd = preferredCwd || metadata?.cwd || info?.cwd || process.cwd();
 		const agents = discoverAgents(cwd, "both").agents;
-		return runAsyncSingleAgent(cwd, agents, "_worker", prompt, ui, sessionId);
+		const requestedAgent = preferredAgent || metadata?.agent || "_worker";
+		const agentName = agents.some((agent) => agent.name === requestedAgent)
+			? requestedAgent
+			: "_worker";
+		return runAsyncSingleAgent(
+			cwd,
+			dispatchDefaults,
+			agents,
+			agentName,
+			prompt,
+			ui,
+			sessionId,
+			metadata?.task,
+		);
 	};
 
 	// ── /agent-results 命令：查看最近完成的 agent 结果 ──
@@ -2649,6 +2765,7 @@ export default function (pi: ExtensionAPI) {
 			prompt: Type.Optional(Type.String({ description: "Instructions after reconnect. Default: continue the previous task" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const dispatchDefaults = dispatchDefaultsFromContext(ctx);
 			const defaultPrompt = "你被主 agent 重新连接了（工具/环境可能已更新）。请先简要总结当前进度，然后继续完成你之前的任务。";
 			const prompt = (params.prompt || "").trim() || defaultPrompt;
 			const running = findRunningTasks({ taskId: params.taskId, agent: params.agent, sessionId: params.sessionId });
@@ -2657,14 +2774,17 @@ export default function (pi: ExtensionAPI) {
 				const sid = (params.sessionId || "").trim();
 				const q = (params.taskId || "").trim();
 				if (sid) {
-					const newTaskId = await resumeSession(sid, prompt, ctx.ui);
+					const newTaskId = await resumeSession(sid, prompt, ctx.ui, dispatchDefaults);
 					return { content: [{ type: "text", text: newTaskId ? `Session ${sid.slice(0, 8)}… resumed as ${newTaskId}` : `Session ${sid} resume failed (not found?)` }] };
 				}
 				if (q) {
 					const taskId = findTaskIdBySubstring(q);
 					const sessionId = taskId ? getTaskSessionId(taskId) : null;
 					if (sessionId) {
-						const newTaskId = await resumeSession(sessionId, prompt, ctx.ui);
+						const metadata = taskId ? getTaskMetadata(taskId) : null;
+						const newTaskId = await resumeSession(
+							sessionId, prompt, ctx.ui, dispatchDefaults, metadata?.cwd, metadata?.agent
+						);
 						return { content: [{ type: "text", text: newTaskId ? `Task "${taskId}" (session ${sessionId.slice(0, 8)}…) resumed as ${newTaskId}` : "Resume failed" }] };
 					}
 				}
@@ -2675,7 +2795,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const results: string[] = [];
 			for (const { taskId } of running) {
-				results.push(await reloadTask(taskId, prompt, ctx.ui));
+				results.push(await reloadTask(taskId, prompt, ctx.ui, dispatchDefaults));
 			}
 			return { content: [{ type: "text", text: results.join("\n") }] };
 		},
@@ -2721,8 +2841,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /agent:resume <session-id> [continue instructions]", "error");
 				return;
 			}
-			// 用 _worker 通用 agent 重连既有会话
-			const taskId = await runAsyncSingleAgent(ctx.cwd, [], "_worker", continueTask, ctx.ui, sessionId);
+			const taskId = await resumeSession(
+				sessionId,
+				continueTask,
+				ctx.ui,
+				dispatchDefaultsFromContext(ctx),
+				ctx.cwd,
+			);
 			if (!taskId) {
 				ctx.ui.notify(`Failed to resume session ${sessionId}`, "error");
 				return;
