@@ -30,6 +30,7 @@ import {
 import { Container, Markdown, Spacer, Text, type Focusable, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { extractItemIds } from "./identity.mjs";
 
 // ── RMUX integration ──
 const RMUX_SESSION_NAME = "pi-agents";
@@ -147,18 +148,6 @@ function mutateWorkerRegistry(taskId: string, record?: Record<string, unknown>):
 	}
 }
 
-function extractItemIds(taskText?: string): string[] {
-	const text = taskText || "";
-	const explicit: string[] = [];
-	for (const re of [/(?:item(?:Id)?|题目|活动)[\s:=：#-]*(\d{6})/gi, /\/activity\/(\d{6})(?:\b|\/)/g]) {
-		for (const m of text.matchAll(re)) explicit.push(m[1]);
-	}
-	if (explicit.length) return [...new Set(explicit)];
-	const bare = [...new Set(text.match(/\b\d{6}\b/g) || [])];
-	// 兼容历史 prompt：约定任务开头第一个六位数就是目标 item；新任务应显式写 itemId。
-	return bare.length ? [bare[0]] : [];
-}
-
 function assertNoWorkerItemCollision(taskId: string, cwd: string, itemIds: string[]): void {
 	if (itemIds.length === 0) return;
 	try {
@@ -177,6 +166,10 @@ function assertNoWorkerItemCollision(taskId: string, cwd: string, itemIds: strin
 }
 
 function registerWorker(taskId: string, cwd: string, taskText?: string): void {
+	if (workerLogIsSettled(taskId)) {
+		mutateWorkerRegistry(taskId);
+		return;
+	}
 	const itemIds = extractItemIds(taskText);
 	assertNoWorkerItemCollision(taskId, cwd, itemIds);
 	mutateWorkerRegistry(taskId, {
@@ -1084,6 +1077,13 @@ function getAsyncTasks(): Map<string, AsyncTaskEntry> {
 	return g[GLOBAL_TASKS_KEY] as Map<string, AsyncTaskEntry>;
 }
 const asyncTasks = getAsyncTasks();
+const GLOBAL_COMPLETION_SENDER_KEY = "__pi_subagent_completion_sender__";
+
+function sendCompletionToCurrentSession(fallbackPi: any, body: string): void {
+	const sender = (globalThis as any)[GLOBAL_COMPLETION_SENDER_KEY];
+	if (typeof sender === "function") sender(body);
+	else fallbackPi.sendUserMessage(body, { deliverAs: "steer" });
+}
 
 // 诊断:记录扩展加载 + rmux 可用性(帮助排查"新 pi 看不到 subagent")
 function diagLog(msg: string) {
@@ -1371,7 +1371,7 @@ function findTaskIdBySubstring(q: string): string | null {
 	} catch { return null; }
 }
 
-// ── usage / 成本统计（数据来自 pi 原生 message_end.usage，含 cost；窗口来自 models-store.json）──
+// ── usage / 成本统计（数据来自 pi 原生 message_end.usage，含 cost；窗口来自有效模型配置）──
 
 export interface TaskUsage {
 	input: number; output: number; cacheRead: number; cacheWrite: number;
@@ -1381,17 +1381,35 @@ export interface TaskUsage {
 }
 
 let _ctxWindowCache: Record<string, number> | null = null;
-// 从 ~/.pi/agent/models-store.json 读模型 contextWindow（与主 agent footer 的 “/1000.0k” 同源）
+// 读取原始 models-store 后，再叠加 models.json 的 modelOverrides。
+// models-store 是供应商原始元数据；models.json 才是 pi 的有效用户配置。
+// 只读 models-store 会把 openai-codex 的 1M override 错显示成 272K。
 function getModelContextWindow(model: string): number | undefined {
 	if (!model) return undefined;
 	try {
 		if (!_ctxWindowCache) {
 			_ctxWindowCache = {};
-			const p = path.join(getAgentDir(), "models-store.json");
-			const data = JSON.parse(fs.readFileSync(p, "utf-8"));
-			for (const prov of Object.values(data)) {
-				for (const m of ((prov as any)?.models) || []) {
-					if (m?.id && m?.contextWindow) _ctxWindowCache[m.id] = m.contextWindow;
+			const storePath = path.join(getAgentDir(), "models-store.json");
+			const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
+			for (const [provider, config] of Object.entries(store)) {
+				for (const m of ((config as any)?.models) || []) {
+					if (m?.id && m?.contextWindow) {
+						_ctxWindowCache[m.id] = m.contextWindow;
+						_ctxWindowCache[`${provider}/${m.id}`] = m.contextWindow;
+					}
+				}
+			}
+
+			// Apply effective user overrides, including provider/model-specific keys.
+			const configPath = path.join(getAgentDir(), "models.json");
+			const modelsConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+			for (const [provider, config] of Object.entries(modelsConfig)) {
+				for (const [id, override] of Object.entries((config as any)?.modelOverrides || {})) {
+					const window = (override as any)?.contextWindow;
+					if (typeof window === "number" && window > 0) {
+						_ctxWindowCache[id] = window;
+						_ctxWindowCache[`${provider}/${id}`] = window;
+					}
 				}
 			}
 		}
@@ -1433,7 +1451,9 @@ function accumulateTaskUsage(taskId: string, entry: AsyncTaskEntry): void {
 			u.cost += w.cost?.total || 0;
 			u.turns++;
 			u.contextTokens = (w.cacheRead || 0) + (w.input || 0);
-			if (u.contextWindow === undefined) u.contextWindow = getModelContextWindow(m.model);
+			// Re-resolve on every message: reload/config changes must update existing task rows too.
+			const resolvedWindow = getModelContextWindow(m.model);
+			if (resolvedWindow !== undefined) u.contextWindow = resolvedWindow;
 		}
 	} catch {}
 }
@@ -2130,6 +2150,7 @@ export default function (pi: ExtensionAPI) {
 		taskText: string,
 		ui?: any,  // ExtensionUIContext from execute ctx
 		resumeSessionId?: string,  // 若提供，则用 --session <id> 重连既有会话而非新建
+		registryTaskText?: string,  // reload 时保留原始任务文本，避免续作提示中的讨论ID污染 item gate
 	): Promise<string> => {
 		let agent = agents.find((a) => a.name === agentName);
 		// _worker: 通用 worker，不依赖预注册 agent
@@ -2139,7 +2160,9 @@ export default function (pi: ExtensionAPI) {
 		if (!agent) return "";
 
 		const taskId = generateTaskId();
-		registerWorker(taskId, cwd, taskText);
+		// Registry identity must come from the original task on resume, not the
+		// continuation prompt (which may mention discussion IDs or other items).
+		registerWorker(taskId, cwd, registryTaskText ?? taskText);
 
 		// 构建 pi 参数
 		const piArgs: string[] = ["--mode", "json", "-p"];
@@ -2185,7 +2208,7 @@ export default function (pi: ExtensionAPI) {
 				const sessionPath = getSubagentSessionPath(taskId, cwd);
 				try { fs.writeFileSync(sessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
 				const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-					`export PI_SUBAGENT_TASK_ID=${shellQuote(taskId)} && cd ${cwd} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${logPath}`);
+					`export PI_SUBAGENT_TASK_ID=${shellQuote(taskId)} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
 
 				if (r.returnCode === 0) {
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
@@ -2193,7 +2216,7 @@ export default function (pi: ExtensionAPI) {
 					asyncTasks.set(taskId, {
 						agent: agentName, task: taskText, proc: dummyProc, startTime: Date.now(),
 						useRmux: true, rmuxTarget, rmuxAttachCmd: attachCmd,
-						cwd, sessionId: resumeSessionId || currentSessionId || undefined,
+						cwd, sessionId: resumeSessionId || undefined,
 					});
 
 					const cleanup = () => {
@@ -2264,7 +2287,7 @@ export default function (pi: ExtensionAPI) {
 								: stopReason === "error"
 									? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：最后一轮被模型/provider 错误打断（stopReason=error），无文本输出。可用 subagent_reload 恢复该任务继续。`
 									: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
-							pi.sendUserMessage(body, { deliverAs: "steer" });
+							sendCompletionToCurrentSession(pi, body);
 						} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 					};
 
@@ -2285,7 +2308,7 @@ export default function (pi: ExtensionAPI) {
 		asyncTasks.set(taskId, {
 			agent: agentName, task: taskText, proc, startTime: Date.now(),
 			useRmux: false,
-			cwd, sessionId: resumeSessionId || currentSessionId || undefined,
+			cwd, sessionId: resumeSessionId || undefined,
 		});
 
 		let rawStdout = "";
@@ -2364,7 +2387,7 @@ export default function (pi: ExtensionAPI) {
 						: stopReason === "error"
 							? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：最后一轮被模型/provider 错误打断（stopReason=error），无文本输出。可用 subagent_reload 恢复该任务继续。`
 							: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
-					pi.sendUserMessage(body, { deliverAs: "steer" });
+					sendCompletionToCurrentSession(pi, body);
 				} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 			}
 		});
@@ -2415,7 +2438,7 @@ export default function (pi: ExtensionAPI) {
 		const cwd = entry.cwd || process.cwd();
 		const agents = discoverAgents(cwd, "both").agents;
 		const agentName = agents.some((x) => x.name === entry.agent) ? entry.agent : "_worker";
-		const newTaskId = await runAsyncSingleAgent(cwd, agents, agentName, prompt, ui, resumeTarget);
+		const newTaskId = await runAsyncSingleAgent(cwd, agents, agentName, prompt, ui, resumeTarget, entry.task);
 		return newTaskId
 			? `- ${taskId} (${entry.agent}) killed → resumed session ${sessionId.slice(0, 8)}… as ${newTaskId}`
 			: `- ${taskId} (${entry.agent}): resume failed`;
@@ -2589,7 +2612,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const all = findRunningTasks({});
 			const lines = all.map(({ taskId, entry }) => {
-				if (!entry.sessionId) entry.sessionId = getTaskSessionId(taskId) || undefined;
+				const actualSessionId = getTaskSessionId(taskId);
+				if (actualSessionId) entry.sessionId = actualSessionId;
 				if (!entry.usage || !entry.usage.turns) accumulateTaskUsage(taskId, entry);
 				const sess = entry.sessionId ? ` session=${entry.sessionId}` : "";
 				return `- ${taskId} agent=${entry.agent}${sess} rmux=${entry.useRmux ? "yes" : "no"}${fmtUsageShort(entry.usage)} task="${entry.task.slice(0, 100)}"`;
@@ -2759,6 +2783,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
+		// Completion callbacks from a pre-/reload or pre-/new extension instance
+		// survive with asyncTasks. Route them through the newest session API.
+		(globalThis as any)[GLOBAL_COMPLETION_SENDER_KEY] = (body: string) =>
+			pi.sendUserMessage(body, { deliverAs: "steer" });
 		// reload 后 asyncTasks 保存在 globalThis，重新把仍存活的任务注册给
 		// watcher 路由；否则新模块会把它们误判成 stale target。
 		for (const [id, entry] of asyncTasks) {
