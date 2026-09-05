@@ -16,6 +16,7 @@ import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -804,13 +805,26 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	contextWindow?: number;
 }
 
 function dispatchDefaultsFromContext(ctx: any): DispatchDefaults {
+	const contextWindow = Number(ctx?.model?.contextWindow);
 	return {
 		model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 		thinkingLevel: ctx.thinkingLevel,
+		contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? Math.floor(contextWindow) : undefined,
 	};
+}
+
+function appendInheritedContextExtension(args: string[], contextWindow?: number): void {
+	if (!contextWindow) return;
+	const extensionPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "context-inherit.ts");
+	if (fs.existsSync(extensionPath)) args.push("--extension", extensionPath);
+}
+
+function inheritedContextEnv(contextWindow?: number): Record<string, string> {
+	return contextWindow ? { PI_SUBAGENT_CONTEXT_WINDOW: String(contextWindow) } : {};
 }
 
 async function runSingleAgent(
@@ -868,6 +882,7 @@ async function runSingleAgent(
 	if (dispatch.thinkingLevel) args.push("--thinking", dispatch.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 	if (fs.existsSync(path.join(cwd ?? defaultCwd, '.mcp.json'))) args.push('--mcp-config', path.join(cwd ?? defaultCwd, '.mcp.json'));
+	appendInheritedContextExtension(args, dispatch.contextWindow);
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -958,8 +973,12 @@ async function runSingleAgent(
 			const piCommand = [process.execPath, process.argv[1]!, ...args].map(shellQ).join(" ");
 			const workdir = cwd ?? defaultCwd;
 			// 注入 PI_SUBAGENT_TASK_ID（agent-notify 定向路由用：每个 subagent 独立通知目录）
+			const contextEnv = inheritedContextEnv(dispatch.contextWindow);
+			const contextExport = contextEnv.PI_SUBAGENT_CONTEXT_WINDOW
+				? ` PI_SUBAGENT_CONTEXT_WINDOW=${shellQ(contextEnv.PI_SUBAGENT_CONTEXT_WINDOW)}`
+				: "";
 			const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-				`export PI_SUBAGENT_TASK_ID=${shellQ(taskId)} && cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
+				`export PI_SUBAGENT_TASK_ID=${shellQ(taskId)}${contextExport} && cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
 			if (r.returnCode !== 0) {
 				currentResult.stderr = `rmux new-window failed: ${String(r.stderr || r.stdout).slice(0, 300)}`;
 				exitCode = 1;
@@ -991,6 +1010,7 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, ...inheritedContextEnv(dispatch.contextWindow) },
 			});
 			let buffer = "";
 
@@ -1481,7 +1501,8 @@ function getModelContextWindow(model: string): number | undefined {
 			// Apply effective user overrides, including provider/model-specific keys.
 			const configPath = path.join(getAgentDir(), "models.json");
 			const modelsConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-			for (const [provider, config] of Object.entries(modelsConfig)) {
+			const providerConfigs = modelsConfig.providers ?? modelsConfig;
+			for (const [provider, config] of Object.entries(providerConfigs)) {
 				for (const [id, override] of Object.entries((config as any)?.modelOverrides || {})) {
 					const window = (override as any)?.contextWindow;
 					if (typeof window === "number" && window > 0) {
@@ -2254,6 +2275,7 @@ export default function (pi: ExtensionAPI) {
 		if (dispatch.thinkingLevel) piArgs.push("--thinking", dispatch.thinkingLevel);
 		if (agent.tools && agent.tools.length > 0) piArgs.push("--tools", agent.tools.join(","));
 		if (fs.existsSync(path.join(cwd, '.mcp.json'))) piArgs.push('--mcp-config', path.join(cwd, '.mcp.json'));
+		appendInheritedContextExtension(piArgs, dispatch.contextWindow);
 		let tmpPromptPath: string | null = null;
 		if (!resumeSessionId && agent.systemPrompt.trim()) {
 			tmpPromptPath = path.join(os.tmpdir(), `pi-${taskId}.md`);
@@ -2292,8 +2314,12 @@ export default function (pi: ExtensionAPI) {
 				const filterScript = getJsonlFilterPath();
 				const sessionPath = getSubagentSessionPath(taskId, cwd);
 				try { fs.writeFileSync(sessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
+				const contextEnv = inheritedContextEnv(dispatch.contextWindow);
+				const contextExport = contextEnv.PI_SUBAGENT_CONTEXT_WINDOW
+					? ` PI_SUBAGENT_CONTEXT_WINDOW=${shellQuote(contextEnv.PI_SUBAGENT_CONTEXT_WINDOW)}`
+					: "";
 				const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-					`export PI_SUBAGENT_TASK_ID=${shellQuote(taskId)} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
+					`export PI_SUBAGENT_TASK_ID=${shellQuote(taskId)}${contextExport} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
 
 				if (r.returnCode === 0) {
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
@@ -2387,7 +2413,11 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ── fallback: spawn 方式 ──
-		const proc = spawn(process.execPath, [process.argv[1]!, ...piArgs], { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_SUBAGENT_TASK_ID: taskId } });
+		const proc = spawn(process.execPath, [process.argv[1]!, ...piArgs], {
+			cwd,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, PI_SUBAGENT_TASK_ID: taskId, ...inheritedContextEnv(dispatch.contextWindow) },
+		});
 		const fbSessionPath = getSubagentSessionPath(taskId, cwd);
 		try { fs.writeFileSync(fbSessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
 
