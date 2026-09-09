@@ -33,6 +33,7 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { extractItemIds } from "./identity.mjs";
 import { resolveDispatchConfig } from "./dispatch.mjs";
+import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
 
 // ── RMUX integration ──
 const RMUX_SESSION_NAME = "pi-agents";
@@ -1427,17 +1428,7 @@ function formatRunningTasks(list: { taskId: string; entry: AsyncTaskEntry }[]): 
 // pi --session <id> 会把 id 解析到先扫到的同 id 文件——镜像头 id 相同,
 // 可能被选中导致 getSessionFile 返回镜像路径(reload 后 desktop 归属断裂)。
 function findRealSessionPath(sessionId: string): string | null {
-	try {
-		const sessionsRoot = path.join(getAgentDir(), "sessions");
-		for (const dirName of fs.readdirSync(sessionsRoot)) {
-			const dir = path.join(sessionsRoot, dirName);
-			let files: string[] = [];
-			try { files = fs.readdirSync(dir); } catch { continue; }
-			const hit = files.find((f) => f.includes(sessionId) && !f.includes("subagent-task"));
-			if (hit) return path.join(dir, hit);
-		}
-	} catch {}
-	return null;
+	return findRealSessionPathInRoot(path.join(getAgentDir(), "sessions"), sessionId);
 }
 
 // 根据 sessionId 找到真实 session 文件，读取其 cwd（重连暂停/已结束的会话时用）
@@ -2586,6 +2577,11 @@ export default function (pi: ExtensionAPI) {
 		const agentName = agents.some((agent) => agent.name === requestedAgent)
 			? requestedAgent
 			: "_worker";
+		// Match reloadTask: a bare id is ambiguous because every task mirror keeps
+		// the child session id in its header.  If pi resolves a mirror first, the
+		// resumed process appends there while the canonical session stays stale,
+		// and desktop/plugin session-id de-duplication hides the continuation.
+		const resumeTarget = resolveResumeTarget(path.join(getAgentDir(), "sessions"), sessionId);
 		return runAsyncSingleAgent(
 			cwd,
 			dispatchDefaults,
@@ -2593,7 +2589,7 @@ export default function (pi: ExtensionAPI) {
 			agentName,
 			prompt,
 			ui,
-			sessionId,
+			resumeTarget,
 			metadata?.task,
 		);
 	};
