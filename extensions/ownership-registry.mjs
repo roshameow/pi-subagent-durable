@@ -117,6 +117,10 @@ function withRegistryLock(registryPath, fn, options = {}) {
 export function registerWorkerOwnership(registryPath, record, options = {}) {
   const itemKeys = normalizeKeys(record);
   return withRegistryLock(registryPath, (data) => {
+    const current = data.workers[record.taskId];
+    if (current && current.ownerToken && current.ownerToken !== record.ownerToken && pidAlive(Number(current.ownerPid ?? current.pid))) {
+      throw new Error(`worker ownership token mismatch for ${record.taskId}`);
+    }
     const otherWorkers = Object.entries(data.workers).filter(([taskId]) => taskId !== record.taskId);
     const activeTaskIds = new Set(otherWorkers.map(([taskId]) => taskId));
     for (const taskId of options.externalActiveTaskIds || []) {
