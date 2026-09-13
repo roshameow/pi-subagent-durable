@@ -44,11 +44,12 @@ pi -e ./pi-subagent-durable
 | `subagent` | Delegate tasks (single / parallel / chain). Runs async in the background with a persistent pane. |
 | `subagent_list` | List running subagents: taskId / agent / sessionId / context usage / task summary. |
 | `subagent_reload` | **Kill + reconnect** a running subagent without losing context (resumed from its saved session, picks up freshly loaded tools/extensions/MCP). Also resumes paused/finished sessions directly. Match by `taskId` / `agent` / `sessionId`; none given = all. |
-| `subagent_stop` | Kill a running subagent without resuming (session file preserved for later). |
+| `subagent_stop` | Kill a task and its descendants without resuming; no selector triggers the fast machine-wide emergency stop. |
+| `subagent_gc` | Remove completed/dead rmux panes only; live workers are never touched. |
 
 ### External worker registry and item gate
 
-Active workers are mirrored to `/tmp/pi-agent-notify/.active-workers.json`. Settled worker logs are pruned on registry mutation, and normal sync/async completion unregisters the task. If a task prompt states `itemId=<six digits>`, starting a second active worker for that same item and cwd is rejected. Put the target itemId near the beginning of each worker prompt; this gate supplements, not replaces, project-local lifecycle rules.
+Active workers are mirrored to `/tmp/pi-agent-notify/.active-workers.json`. Registry mutations use an inter-process lock and atomic replace. Settled/dead records are pruned, normal sync/async completion unregisters the task, and the same transaction enforces a machine-wide active-worker cap (default: 15). If a task prompt states `itemKey=<safe-key>` or legacy `itemId=<six digits>`, starting a second active worker for that same key and cwd is rejected. Put the target key near the beginning of each worker prompt; this gate supplements, not replaces, project-local lifecycle rules.
 
 An unfinished worker waiting for an external state change must remain active rather than producing `agent_settled`. With `pi-agent-notify`, it starts one bounded detached watcher, calls `arm_notification_wait`, and finishes its model turn. The notify extension holds the child's `agent_end`, so the process and registry ownership stay live without a foreground sleep/poll script; a directed `notify_agent.py --item <ownedItem> --to <taskId>` event queues the next run in the same session. Delivered/terminal workers do not arm a lease and exit normally.
 
@@ -83,7 +84,30 @@ Changes to agent definitions are picked up on the next call (no reload needed). 
 /agent-live                    # TUI view of running agents (or Alt+A)
 /agent-results                 # recent results
 /agent:resume <session-id> [continue instructions]
+/agent:stop-all                # immediate machine-wide emergency stop
+/agent:gc                      # remove dead rmux panes only
 ```
+
+## Safety limits
+
+Safe defaults prevent a worker-decomposition loop from becoming a process storm:
+
+- **One managed nested generation is allowed by default.** Main sessions run at depth 0, workers at depth 1 may create child workers at depth 2, and depth-2 workers cannot spawn again.
+- **At most 15 active durable workers machine-wide.** Admission is serialized through the worker-registry lock, so concurrent Pi sessions cannot race past the limit.
+- **Parallel requests are capped at 15 entries and chains at 8 before either sync or async dispatch.** Omitted `async` means `false`.
+- **Recursive stop is the default.** `subagent_stop { taskId: ... }` includes descendants. Calling `subagent_stop` with no selector, or typing `/agent:stop-all`, terminates the shared `pi-agents` rmux session in one operation and signals fallback children.
+- Only rmux panes with `pane_dead=0` count as running. Completed panes are removed automatically; `/agent:gc` cleans historical dead panes without touching live workers.
+- Every task immediately records parent task/session/path/depth, and new child session headers receive standard `parentSession` lineage for `/resume` and session viewers.
+- Discovery reads only bounded log prefixes, so emergency management does not load multi-gigabyte task logs into memory.
+
+Advanced opt-in overrides (set before starting Pi):
+
+```bash
+PI_SUBAGENT_MAX_DEPTH=3    # allow two nested generations; default 2
+PI_SUBAGENT_MAX_ACTIVE=20  # machine-wide cap; default 15, hard-clamped to 64
+```
+
+Raising these limits weakens the safety boundary. Prefer explicit main-session orchestration.
 
 ### What persists
 
@@ -122,7 +146,7 @@ pi (main session)
        └─ no rmux → plain spawn (same filtering/mirroring, no persistent pane)
 ```
 
-- **Kill / resume**: `subagent_reload` kills the pane (or proc), finds the session id from the log's first `session` event, and re-launches with `pi --session <id>` — full context restored, fresh process picks up new tools/extensions/MCP.
+- **Kill / resume**: `subagent_reload` kills the pane (or proc), finds the session id from the log's first `session` event, and re-launches with `pi --session <id>` — full context restored, fresh process picks up new tools/extensions/MCP. Spawned processes receive `PI_SUBAGENT_DEPTH` and the configured hard limits.
 - **Completion detection** polls pane state (`returnCode` / `(dead)`); no fixed timeout, long tasks are never killed prematurely.
 - **Task ledger** lives on `globalThis` so `/reload` does not lose track of running tasks.
 
@@ -134,7 +158,9 @@ pi (main session)
 
 ## Recent fixes
 
-- **Resume a settled session by canonical file path** — completed-session resume previously passed a bare session id to `pi --session`. Because per-task mirrors intentionally carry the same child session id, pi could resolve a mirror first, split continuation messages across JSONL files, and leave the canonical session stale/hidden after desktop session-id de-duplication. Settled-session resume now resolves and passes the verified non-mirror session file, matching the existing running-task reload path.
+- **Resume a settled session by canonical file path** — completed-session resume resolves and passes the verified non-mirror session file instead of an ambiguous bare session id, preventing continuation data from being split into a mirror.
+- **Recursive subagent process-storm guard** — nesting is limited to one managed generation by default, active workers have an atomic machine-wide cap, sync/async batch limits share the same preflight validation, omitted `async` no longer accidentally means `true`, targeted stop walks descendants, and `/agent:stop-all` provides a constant-time rmux emergency brake.
+- **Orphan/dead-pane management** — external discovery now checks `pane_dead` instead of treating every retained rmux window as running; completion removes its window, `/agent:gc` safely removes historical dead panes, and task/session lineage is persisted at dispatch time.
 - **Inherited model instead of exhausted global default** — an unpinned agent previously launched without `--model`, so the child silently used `settings.json`'s default model even when the parent was running a different healthy model. This could make every subagent immediately end with `stopReason=error` (for example a 429 weekly usage limit). Unpinned single/parallel/chain/resumed agents now inherit the parent model and thinking level.
 - **Exact provider diagnostics + named-agent resume** — provider `errorMessage` is included in completion notifications instead of a generic “last turn interrupted” message. New task logs persist agent identity, so `subagent_reload` resumes the same named agent rather than degrading it to `_worker`.
 - **Completion notification when a subagent ends with empty text** — previously the completion notification was only sent when the parsed `finalText` was non-empty, and `finalText` came from the *last* `message_end` only. A subagent that finished with a tool-call-only / empty assistant message (common after polling an async backtest) produced empty text, so the main agent never got notified. Fixed by extracting the last **non-empty** assistant text across all `message_end` events and always notifying on success (with a fallback message when there is no text).

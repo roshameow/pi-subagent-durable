@@ -12,7 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync, execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,7 +31,21 @@ import {
 import { Container, Markdown, Spacer, Text, type Focusable, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { extractItemIds } from "./identity.mjs";
+import { extractItemKeys } from "./identity.mjs";
+import {
+	heartbeatWorkerOwnerships,
+	registerWorkerOwnership,
+	unregisterWorkerOwnership,
+} from "./ownership-registry.mjs";
+import {
+	assertBatchWithinLimit,
+	assertSubagentSpawnAllowed,
+	childSubagentEnvironment,
+	collectDescendantTaskIds,
+	parseRmuxTaskPanes,
+	readSubagentSafetyConfig,
+	shouldRunSubagentsAsync,
+} from "./safety.mjs";
 import { resolveDispatchConfig } from "./dispatch.mjs";
 import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
 
@@ -94,6 +108,24 @@ function getAgentLogPath(taskId: string): string {
 	return path.join(getAgentLogDir(), `${taskId}.jsonl`);
 }
 
+function readFilePrefix(filePath: string, maxBytes = 64 * 1024): string {
+	const fd = fs.openSync(filePath, "r");
+	try {
+		const stat = fs.fstatSync(fd);
+		const size = Math.min(stat.size, maxBytes);
+		const buffer = Buffer.alloc(size);
+		fs.readSync(fd, buffer, 0, size, 0);
+		return buffer.toString("utf8");
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+function readTaskLogPrefix(taskId: string): string {
+	try { return readFilePrefix(getAgentLogPath(taskId)); }
+	catch { return ""; }
+}
+
 function appendTaskMetadata(
 	logPath: string,
 	taskId: string,
@@ -116,11 +148,45 @@ function appendTaskMetadata(
 	} catch {}
 }
 
-// Shared registry used by external watcher scripts. A stale --to target must
-// never fail silently: notify_agent.py uses this registry to fall back to the
-// main session when the worker has already been replaced or exited.
+// Shared registry used by external notifier scripts. Registry operations are
+// serialized with an inter-process lock and committed with fsync+rename so
+// concurrent main sessions cannot lose each other's worker ownership records.
 function getWorkerRegistryPath(): string {
 	return path.join(process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify", ".active-workers.json");
+}
+
+interface RmuxTaskPane {
+	taskId: string;
+	windowName: string;
+	dead: boolean;
+}
+
+function listRmuxTaskPanes(): RmuxTaskPane[] {
+	const panes: RmuxTaskPane[] = [];
+	try {
+		const output = String(execFileSync("rmux", [
+			"list-panes", "-a", "-F",
+			"#{session_name}|#{window_name}|#{pane_dead}",
+		], { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }));
+		panes.push(...parseRmuxTaskPanes(output, RMUX_SESSION_NAME));
+	} catch {}
+	return panes;
+}
+
+function discoverLiveTaskIdsFast(): string[] {
+	const ids = new Set(listRmuxTaskPanes().filter((pane) => !pane.dead).map((pane) => pane.taskId));
+	try {
+		// Fallback children replace their process title with this exact prefix.
+		// Do not scan arbitrary argv text: delegated prompts may mention task IDs.
+		const processes = String(execFileSync("ps", ["-axo", "command="], {
+			stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
+		}));
+		for (const line of processes.split("\n")) {
+			const match = /^pi-subagent-(task-[a-z0-9]+-[a-z0-9]+)\b/i.exec(line.trim());
+			if (match) ids.add(match[1]);
+		}
+	} catch {}
+	return [...ids];
 }
 
 function workerLogIsSettled(taskId: string): boolean {
@@ -141,70 +207,59 @@ function workerLogIsSettled(taskId: string): boolean {
 	return false;
 }
 
-function mutateWorkerRegistry(taskId: string, record?: Record<string, unknown>): void {
-	try {
-		const registry = getWorkerRegistryPath();
-		fs.mkdirSync(path.dirname(registry), { recursive: true });
-		let data: Record<string, any> = { version: 1, workers: {} };
-		try { data = JSON.parse(fs.readFileSync(registry, "utf-8")); } catch {}
-		if (!data || typeof data !== "object") data = { version: 1, workers: {} };
-		if (!data.workers || typeof data.workers !== "object") data.workers = {};
-		// Remove registrations owned by a dead parent runtime. Workers launched
-		// from an older/reloaded main session must fall back to the main session,
-		// not receive events in a directory nobody consumes.
-		for (const [id, old] of Object.entries(data.workers)) {
-			const ownerPid = Number((old as any)?.pid);
-			if (workerLogIsSettled(id)) {
-				delete data.workers[id];
-				continue;
-			}
-			if (ownerPid && ownerPid !== process.pid) {
-				try { process.kill(ownerPid, 0); } catch { delete data.workers[id]; }
-			}
-		}
-		if (record) data.workers[taskId] = record;
-		else delete data.workers[taskId];
-		const tmp = `${registry}.${process.pid}.tmp`;
-		fs.writeFileSync(tmp, JSON.stringify(data), { encoding: "utf-8", mode: 0o600 });
-		fs.renameSync(tmp, registry);
-	} catch (e) {
-		// diagLog is declared later; defer logging to stderr here.
-		console.warn(`[subagent] worker registry update failed ${taskId}:`, e);
-	}
-}
-
-function assertNoWorkerItemCollision(taskId: string, cwd: string, itemIds: string[]): void {
-	if (itemIds.length === 0) return;
-	try {
-		const data = JSON.parse(fs.readFileSync(getWorkerRegistryPath(), "utf-8"));
-		for (const [id, old] of Object.entries(data?.workers || {})) {
-			if (id === taskId || workerLogIsSettled(id)) continue;
-			const rec = old as any;
-			if (path.resolve(rec?.cwd || "") !== path.resolve(cwd)) continue;
-			const overlap = itemIds.filter((x) => Array.isArray(rec?.itemIds) && rec.itemIds.includes(x));
-			if (overlap.length) throw new Error(`worker item collision: ${overlap.join(",")} already owned by ${id}`);
-		}
-	} catch (e: any) {
-		if (String(e?.message || e).includes("worker item collision")) throw e;
-		// 缺失/旧版 registry 不阻断首次迁移；写入后后续创建即可执行硬门禁。
-	}
+const OWNERSHIP_MAP_KEY = "__pi_subagent_worker_ownerships__";
+function workerOwnerships(): Map<string, string> {
+	const g = globalThis as any;
+	if (!g[OWNERSHIP_MAP_KEY]) g[OWNERSHIP_MAP_KEY] = new Map<string, string>();
+	return g[OWNERSHIP_MAP_KEY];
 }
 
 function registerWorker(taskId: string, cwd: string, taskText?: string): void {
+	const ownerships = workerOwnerships();
 	if (workerLogIsSettled(taskId)) {
-		mutateWorkerRegistry(taskId);
+		unregisterWorker(taskId);
 		return;
 	}
-	const itemIds = extractItemIds(taskText);
-	assertNoWorkerItemCollision(taskId, cwd, itemIds);
-	mutateWorkerRegistry(taskId, {
-		taskId, pid: process.pid, cwd, itemIds,
+	const itemKeys = extractItemKeys(taskText);
+	const ownerToken = ownerships.get(taskId) || crypto.randomUUID();
+	registerWorkerOwnership(getWorkerRegistryPath(), {
+		taskId,
+		ownerPid: process.pid,
+		ownerToken,
+		cwd: path.resolve(cwd),
+		itemKeys,
 		startedAt: new Date().toISOString(),
+	}, {
+		isSettled: workerLogIsSettled,
+		maxActiveWorkers: readSubagentSafetyConfig().maxActive,
+		externalActiveTaskIds: discoverLiveTaskIdsFast(),
 	});
+	ownerships.set(taskId, ownerToken);
 }
 
 function unregisterWorker(taskId: string): void {
-	mutateWorkerRegistry(taskId);
+	const ownerships = workerOwnerships();
+	const ownerToken = ownerships.get(taskId);
+	try {
+		unregisterWorkerOwnership(getWorkerRegistryPath(), taskId, ownerToken, { isSettled: workerLogIsSettled });
+	} finally {
+		ownerships.delete(taskId);
+	}
+}
+
+function ensureWorkerOwnershipHeartbeat(): void {
+	const g = globalThis as any;
+	if (g.__pi_subagent_worker_heartbeat_timer__) return;
+	g.__pi_subagent_worker_heartbeat_timer__ = setInterval(() => {
+		const ownerships = workerOwnerships();
+		if (ownerships.size === 0) return;
+		try {
+			heartbeatWorkerOwnerships(getWorkerRegistryPath(), ownerships, { isSettled: workerLogIsSettled });
+		} catch (error) {
+			console.warn("[subagent] worker registry heartbeat failed:", error);
+		}
+	}, 15000);
+	g.__pi_subagent_worker_heartbeat_timer__.unref?.();
 }
 
 // Keep a small, domain-neutral closeout reminder visible in every task prompt.
@@ -305,7 +360,8 @@ function extractErrorMessage(raw: string): string | undefined {
 	return last;
 }
 
-const MAX_PARALLEL_TASKS = 8;
+const MAX_PARALLEL_TASKS = 15;
+const MAX_CHAIN_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -828,6 +884,22 @@ function inheritedContextEnv(contextWindow?: number): Record<string, string> {
 	return contextWindow ? { PI_SUBAGENT_CONTEXT_WINDOW: String(contextWindow) } : {};
 }
 
+function subagentChildEnv(taskId: string, contextWindow?: number): Record<string, string> {
+	return childSubagentEnvironment(taskId, {
+		...inheritedContextEnv(contextWindow),
+		...(currentSessionId ? { PI_SUBAGENT_PARENT_SESSION_ID: currentSessionId } : {}),
+		...(currentSessionFile ? { PI_SUBAGENT_PARENT_SESSION_FILE: currentSessionFile } : {}),
+		...(process.env.PI_SUBAGENT_TASK_ID ? { PI_SUBAGENT_PARENT_TASK_ID: process.env.PI_SUBAGENT_TASK_ID } : {}),
+	});
+}
+
+function shellEnvAssignments(
+	env: Record<string, string>,
+	quote: (value: string) => string,
+): string {
+	return Object.entries(env).map(([key, value]) => `${key}=${quote(value)}`).join(" ");
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
 	dispatchDefaults: DispatchDefaults,
@@ -840,6 +912,7 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
+	assertSubagentSpawnAllowed();
 	let agent = agents.find((a) => a.name === agentName);
 	// _worker: 通用 worker，不依赖预注册 agent（与 runAsyncSingleAgent 保持一致）
 	if (!agent && agentName === "_worker") {
@@ -876,6 +949,7 @@ async function runSingleAgent(
 		);
 	} catch {}
 	appendTaskMetadata(logPath, taskId, agentName, task, cwd ?? defaultCwd);
+	appendTaskLineage(logPath);
 
 	const args: string[] = ["--mode", "json", "-p"];
 	const dispatch = resolveDispatchConfig(agent.model, dispatchDefaults);
@@ -973,13 +1047,12 @@ async function runSingleAgent(
 			const shellQ = (s: string) => s.match(/^[a-zA-Z0-9_./-]+$/) ? s : `'${s.replace(/'/g, "'\\''")}'`;
 			const piCommand = [process.execPath, process.argv[1]!, ...args].map(shellQ).join(" ");
 			const workdir = cwd ?? defaultCwd;
-			// 注入 PI_SUBAGENT_TASK_ID（agent-notify 定向路由用：每个 subagent 独立通知目录）
-			const contextEnv = inheritedContextEnv(dispatch.contextWindow);
-			const contextExport = contextEnv.PI_SUBAGENT_CONTEXT_WINDOW
-				? ` PI_SUBAGENT_CONTEXT_WINDOW=${shellQ(contextEnv.PI_SUBAGENT_CONTEXT_WINDOW)}`
-				: "";
+			// Inject task identity + bounded nesting depth. Explicitly export these
+			// values because the long-lived rmux daemon may not share this process's env.
+			const childEnv = subagentChildEnv(taskId, dispatch.contextWindow);
+			const childExports = shellEnvAssignments(childEnv, shellQ);
 			const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-				`export PI_SUBAGENT_TASK_ID=${shellQ(taskId)}${contextExport} && cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
+				`export ${childExports} && cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
 			if (r.returnCode !== 0) {
 				currentResult.stderr = `rmux new-window failed: ${String(r.stderr || r.stdout).slice(0, 300)}`;
 				exitCode = 1;
@@ -993,6 +1066,9 @@ async function runSingleAgent(
 						} catch { isDead = true; }
 						if (isDead) {
 							clearInterval(timer);
+							if (panes.returnCode === 0) {
+								try { await rmux.cmd("kill-window", "-t", rmuxTarget.split(".")[0]); } catch {}
+							}
 							// 读 filter 写入的 agent-log,重建 messages(供 {previous} 传递)
 							try {
 								const raw = fs.readFileSync(logPath, "utf-8");
@@ -1011,7 +1087,7 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, ...inheritedContextEnv(dispatch.contextWindow) },
+				env: { ...process.env, ...subagentChildEnv(taskId, dispatch.contextWindow) },
 			});
 			let buffer = "";
 
@@ -1103,8 +1179,14 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode). Omit to auto-use a generic worker." })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode / auto mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	tasks: Type.Optional(Type.Array(TaskItem, {
+		description: `Array of {agent, task} for parallel execution (max ${MAX_PARALLEL_TASKS})`,
+		maxItems: MAX_PARALLEL_TASKS,
+	})),
+	chain: Type.Optional(Type.Array(ChainItem, {
+		description: `Array of {agent, task} for sequential execution (max ${MAX_CHAIN_TASKS})`,
+		maxItems: MAX_CHAIN_TASKS,
+	})),
 	async: Type.Optional(Type.Boolean({
 		description: "Run all tasks in background; return immediately with taskIds. Notify on completion. Default: false",
 		default: false,
@@ -1121,12 +1203,26 @@ const SubagentParams = Type.Object({
 let taskCounter = 0;
 let sessionUI: any = null;
 let currentSessionId = ""; // 本 pi 会话的 id, session_start 时从 sessionManager 取
+let currentSessionFile = ""; // 标准 parentSession 路径/持久 lineage 使用
 let fbParentWritten = false; // fallback spawn 路径的父会话 marker 已写
 
 function generateTaskId(): string {
 	const ts = Date.now().toString(36);
 	const rand = Math.random().toString(36).slice(2, 6);
 	return `task-${ts}-${rand}`;
+}
+
+function appendTaskLineage(logPath: string): void {
+	try {
+		fs.appendFileSync(logPath, JSON.stringify({
+			type: "pi_subagent_parent",
+			parentId: currentSessionId || undefined,
+			parentTaskId: process.env.PI_SUBAGENT_TASK_ID || undefined,
+			parentSessionPath: currentSessionFile || undefined,
+			depth: readSubagentSafetyConfig().depth + 1,
+			timestamp: new Date().toISOString(),
+		}) + "\n");
+	} catch {}
 }
 interface AsyncTaskEntry {
 	agent: string;
@@ -1137,7 +1233,9 @@ interface AsyncTaskEntry {
 	rmuxTarget?: string;     // session:window.pane
 	rmuxAttachCmd?: string;  // user-facing attach command
 	cwd?: string;            // 任务工作目录（重连时需要 --mcp-config / sessions 定位）
-	sessionId?: string;      // pi 会话 id（重连 --session 用，可从 agent-logs 首行 session 事件解析）
+	sessionId?: string;      // 子 agent 自己的 pi 会话 id（重连 --session 用）
+	parentSessionId?: string; // 派生它的父 pi 会话 id（任务树/当前会话过滤用）
+	parentTaskId?: string;    // 若父本身是 worker，记录其 task id
 	intentionalKill?: boolean; // 主 agent 主动 kill（reload/stop），完成回调不再发通知
 	usage?: TaskUsage;       // token/成本/上下文统计（从 agent-logs 增量聚合）
 	statsOffset?: number;    // agent-logs 已解析字节偏移
@@ -1174,7 +1272,7 @@ try {
 // 从 agent-logs 首行 session 事件解析 pi 会话 id（--session 重连用）
 function getTaskSessionId(taskId: string): string | null {
 	try {
-		const raw = fs.readFileSync(getAgentLogPath(taskId), "utf-8");
+		const raw = readTaskLogPrefix(taskId);
 		for (const l of raw.split("\n")) {
 			if (!l.trim()) continue;
 			const ev = JSON.parse(l);
@@ -1186,7 +1284,7 @@ function getTaskSessionId(taskId: string): string | null {
 
 function getTaskMetadata(taskId: string): { agent?: string; task?: string; cwd?: string } | null {
 	try {
-		const raw = fs.readFileSync(getAgentLogPath(taskId), "utf-8");
+		const raw = readTaskLogPrefix(taskId);
 		for (const line of raw.split("\n")) {
 			if (!line.trim()) continue;
 			const event = JSON.parse(line);
@@ -1213,7 +1311,7 @@ function findTaskIdBySessionId(sessionId: string): string | null {
 //(spawn 时由 filter 脚本写入);老任务 fallback 到 agent-log 首行 session id
 function getTaskParentSessionId(taskId: string): string | null {
 	try {
-		const raw = fs.readFileSync(getAgentLogPath(taskId), "utf-8");
+		const raw = readTaskLogPrefix(taskId);
 		for (const l of raw.split("\n")) {
 			if (!l.trim()) continue;
 			const ev = JSON.parse(l);
@@ -1227,8 +1325,8 @@ function getTaskParentSessionId(taskId: string): string | null {
 // 使该任务随后的完成回调只清理、不通知主会话
 // 注意：entry 可能来自本进程 asyncTasks（自己 spawn 的），也可能来自
 // discoverExternalTasks（父 pi 已死/其他 pi spawn 的孤儿），两种都要能杀。
-async function killTask(taskId: string): Promise<boolean> {
-	const entry = asyncTasks.get(taskId) || discoverExternalTasks().get(taskId);
+async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<boolean> {
+	const entry = knownEntry || asyncTasks.get(taskId) || discoverExternalTasks(true).get(taskId);
 	if (!entry) return false;
 	entry.intentionalKill = true;
 	try {
@@ -1249,7 +1347,7 @@ async function killTask(taskId: string): Promise<boolean> {
 			}
 			// 2) 兜底：直接走 rmux CLI（绕过 stale 的 SDK 客户端）
 			try {
-				execSync(`rmux kill-window -t ${windowTarget}`, { stdio: "ignore", timeout: 8000 });
+				execFileSync("rmux", ["kill-window", "-t", windowTarget], { stdio: "ignore", timeout: 8000 });
 				diagLog(`kill ok (cli) ${taskId} -> ${windowTarget}`);
 				return true;
 			} catch (e) {
@@ -1259,7 +1357,7 @@ async function killTask(taskId: string): Promise<boolean> {
 		// 3) 最终兜底：窗口探测/关闭都失败时按 taskId 杀进程树
 		// （父 pi 已死的孤儿，agent-log 路径/子代理 cmdline 都含 taskId）
 		try {
-			execSync(`pkill -f ${taskId}`, { stdio: "ignore", timeout: 8000 });
+			execFileSync("pkill", ["-f", taskId], { stdio: "ignore", timeout: 8000 });
 			diagLog(`kill ok (pkill) ${taskId}`);
 			return true;
 		} catch (e) {
@@ -1277,31 +1375,110 @@ async function killTask(taskId: string): Promise<boolean> {
 	return false;
 }
 
+function signalFallbackProcesses(taskIds?: Set<string>): number {
+	let signaled = 0;
+	try {
+		const processes = String(execFileSync("ps", ["-axo", "pid=,command="], {
+			stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
+		}));
+		for (const line of processes.split("\n")) {
+			const match = /^\s*(\d+)\s+pi-subagent-(task-[a-z0-9]+-[a-z0-9]+)\b/i.exec(line);
+			if (!match || (taskIds && taskIds.size > 0 && !taskIds.has(match[2]))) continue;
+			const pid = Number(match[1]);
+			if (!Number.isInteger(pid) || pid < 2 || pid === process.pid) continue;
+			try { process.kill(pid, "SIGTERM"); signaled++; } catch {}
+		}
+	} catch {}
+	return signaled;
+}
+
+async function cleanupDeadRmuxWindows(dryRun = false): Promise<{ found: number; removed: number }> {
+	const deadWindows = [...new Set(
+		listRmuxTaskPanes().filter((pane) => pane.dead).map((pane) => pane.windowName),
+	)];
+	if (dryRun || deadWindows.length === 0) return { found: deadWindows.length, removed: 0 };
+	const results = await mapWithConcurrencyLimit(deadWindows, MAX_CONCURRENCY, async (windowName) => {
+		const target = `${RMUX_SESSION_NAME}:${windowName}`;
+		try {
+			const rmux = await getRmux();
+			if (rmux) {
+				const result = await rmux.cmd("kill-window", "-t", target);
+				if (result.returnCode === 0) return true;
+			}
+		} catch {}
+		try {
+			execFileSync("rmux", ["kill-window", "-t", target], { stdio: "ignore", timeout: 5000 });
+			return true;
+		} catch { return false; }
+	});
+	_extCache = null;
+	return { found: deadWindows.length, removed: results.filter(Boolean).length };
+}
+
+async function emergencyStopAll(running: { taskId: string; entry: AsyncTaskEntry }[]): Promise<string> {
+	const taskIds = new Set(running.map(({ taskId }) => taskId));
+	for (const taskId of taskIds) {
+		const local = asyncTasks.get(taskId);
+		if (local) local.intentionalKill = true;
+	}
+
+	let rmuxStopped = false;
+	// Always try the shared session in emergency mode. Discovery itself may be
+	// degraded during a process storm, so an empty/stale task list must not make
+	// the emergency brake a no-op.
+	{
+		try {
+			const rmux = await getRmux();
+			if (rmux) {
+				const result = await rmux.cmd("kill-session", "-t", RMUX_SESSION_NAME);
+				rmuxStopped = result.returnCode === 0;
+			}
+		} catch { rmuxClient = null; rmuxAvailable = null; }
+		if (!rmuxStopped) {
+			try {
+				execFileSync("rmux", ["kill-session", "-t", RMUX_SESSION_NAME], { stdio: "ignore", timeout: 8000 });
+				rmuxStopped = true;
+			} catch { /* session may already be gone */ }
+		}
+	}
+
+	let fallbackSignals = signalFallbackProcesses(taskIds);
+	for (const { taskId, entry } of running) {
+		if (!entry.useRmux) {
+			const local = asyncTasks.get(taskId);
+			if (local?.proc && local.proc.exitCode === null && !local.proc.killed) {
+				try { local.proc.kill("SIGTERM"); fallbackSignals++; } catch {}
+			}
+		}
+		try { unregisterWorker(taskId); } catch {}
+	}
+	_extCache = null;
+	return `Emergency stop issued for ${running.length} tracked task(s)` +
+		`${rmuxStopped ? "; rmux session terminated" : ""}` +
+		`${fallbackSignals ? `; ${fallbackSignals} fallback process(es) signaled` : ""}.`;
+}
+
 // ── 从文件系统发现运行中的任务 ──
 // subagent_list / 实时 UI 只遍历当前 pi 进程内存里的 asyncTasks,看不到其他 pi
 // 进程 spawn 的子代理。这里扫描 agent-logs,进程存活(ps)或 rmux 窗口存在即视为
 // running,合并进列表(带 3s 缓存,避免高频轮询时反复 execSync)。
 let _extCache: { at: number; map: Map<string, AsyncTaskEntry> } | null = null;
-function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
+function discoverExternalTasks(force = false): Map<string, AsyncTaskEntry> {
 	const now = Date.now();
-	// 15s 缓存:每个 pi 进程都独立轮询(spawn ps/rmux + readdir 全目录),
-	// 3s 时 10 个 pi 合计烧 ~170% CPU(实测 14 个 pi × 12-17%)。
-	// 15s 后单次开销不变但频率降 5 倍,widget 显示延迟 15s 可接受。
-	if (_extCache && now - _extCache.at < 15000) return _extCache.map;
+	// 15s cache for UI polling. Stop/list safety paths may force a fresh scan so
+	// a newly-created task can never hide behind stale discovery state.
+	if (!force && _extCache && now - _extCache.at < 15000) return _extCache.map;
 	const out = new Map<string, AsyncTaskEntry>();
 	const dir = getAgentLogDir();
 	let names: string[] = [];
 	try { names = fs.readdirSync(dir); } catch { return out; }
-	// rmux pi-agents 窗口名集合(判断 rmux 存活)
-	const rmuxWinName = (line: string): string => {
-		// "3: _worker-task-xxx (1 panes)..." -> "_worker-task-xxx"
-		return line.replace(/^\d+:\s*/, "").split(/\s+/)[0].replace(/\*$/, "");
-	};
-	let rmuxWindows = new Set<string>();
-	try {
-		const r = execSync("rmux list-windows -t pi-agents", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 });
-		rmuxWindows = new Set(String(r).split("\n").map((l) => rmuxWinName(l)).filter(Boolean));
-	} catch {}
+	// Only pane_dead=0 is alive. Old code treated every retained window as
+	// running, so hundreds of completed dead panes appeared as active orphans.
+	const liveRmuxTasks = new Map(
+		listRmuxTaskPanes()
+			.filter((pane) => !pane.dead)
+			.map((pane) => [pane.taskId, pane.windowName]),
+	);
 	// 非 rmux 路径:进程存活
 	let psOut = "";
 	try { psOut = String(execSync("ps -axo command", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 })); } catch {}
@@ -1314,41 +1491,46 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 		// 存活判断提前到读文件之前:112 个 task 日志累计 121MB,
 		// 每轮全量 readFileSync 是 CPU 大头(实测单次 496ms/pi/3s)。
 		// 只有活着的任务才需要读文件(通常 0-3 个)。
-		const winName = [...rmuxWindows].find((w) => w.includes(taskId));
-		const alive = winName ? true : psOut.includes(`${taskId}.jsonl`);
+		const winName = liveRmuxTasks.get(taskId);
+		const alive = winName ? true : psOut.includes(`pi-subagent-${taskId}`);
 		if (!alive) continue;
 		const logPath = path.join(dir, name);
 		let raw = "";
-		try { raw = fs.readFileSync(logPath, "utf-8"); } catch { continue; }
+		try { raw = readFilePrefix(logPath); } catch { continue; }
 		const lines = raw.split("\n").filter(Boolean);
 		if (!lines.length) continue;
 		// 结束检测:最后一行是终态事件则跳过
 		let lastType = "";
 		try { lastType = (JSON.parse(lines[lines.length - 1]).type || "") as string; } catch {}
 		if (lastType === "agent_end" || lastType === "agent_settled") continue;
-		// agent 名:窗口名 <agent>-task-<id>
 		let agent = "unknown";
-		if (winName) {
-			const m = /^([\w-]+)-task-/.exec(winName);
-			if (m) agent = m[1];
-		}
-		// task 文本:首条 user 消息(日志里是 message_start/message_end 事件)
 		let task = "";
-		try {
-			for (const l of lines.slice(1, 30)) {
-				const ev = JSON.parse(l);
-				if (
-					(ev.type === "message_start" || ev.type === "message_end") &&
-					ev.message?.role === "user" &&
-					Array.isArray(ev.message.content)
-				) {
-					task = typeof ev.message.content[0]?.text === "string" ? ev.message.content[0].text : "";
-					if (task) break;
-				}
-			}
-		} catch {}
 		let cwd = "";
-		try { cwd = (JSON.parse(lines[0]).cwd as string) || ""; } catch {}
+		let childSessionId = "";
+		let parentSessionId = "";
+		let parentTaskId = "";
+		for (const line of lines.slice(0, 80)) {
+			try {
+				const event = JSON.parse(line);
+				if (event.type === "pi_subagent_task") {
+					agent = String(event.agent || agent);
+					task = String(event.task || task);
+					cwd = String(event.cwd || cwd);
+				} else if (event.type === "session" && !childSessionId) {
+					childSessionId = String(event.id || "");
+					cwd ||= String(event.cwd || "");
+				} else if (event.type === "pi_subagent_parent") {
+					parentSessionId = String(event.parentId || parentSessionId);
+					parentTaskId = String(event.parentTaskId || parentTaskId);
+				} else if (!task && (event.type === "message_start" || event.type === "message_end") && event.message?.role === "user") {
+					task = typeof event.message.content?.[0]?.text === "string" ? event.message.content[0].text : "";
+				}
+			} catch { /* partial prefix line */ }
+		}
+		if (agent === "unknown" && winName) {
+			const match = /^([\w-]+)-task-/.exec(winName);
+			if (match) agent = match[1];
+		}
 		let startTime = now;
 		try { startTime = fs.statSync(logPath).mtimeMs; } catch {}
 		out.set(taskId, {
@@ -1359,7 +1541,9 @@ function discoverExternalTasks(): Map<string, AsyncTaskEntry> {
 			rmuxTarget: winName ? `pi-agents:${winName}.0` : undefined,
 			rmuxAttachCmd: "rmux attach -t pi-agents",
 			cwd: cwd || undefined,
-			sessionId: getTaskParentSessionId(taskId) || undefined,
+			sessionId: childSessionId || getTaskSessionId(taskId) || undefined,
+			parentSessionId: parentSessionId || getTaskParentSessionId(taskId) || undefined,
+			parentTaskId: parentTaskId || undefined,
 			proc: { killed: false, exitCode: null },
 		});
 	}
@@ -1380,7 +1564,7 @@ function renderSubagentWidget(u: any) {
 	// 导致每个 pi 会话的 terminal 都显示同样的 widget,而不是只在父会话。
 	const all = new Map(asyncTasks);
 	for (const [id, e] of discoverExternalTasks()) {
-		if (!all.has(id) && e.sessionId === currentSessionId) all.set(id, e);
+		if (!all.has(id) && e.parentSessionId === currentSessionId) all.set(id, e);
 	}
 	for (const [id, t] of all) {
 		const alive = t.useRmux ? Boolean(t.rmuxTarget) : (t.proc && !t.proc.killed && t.proc.exitCode === null);
@@ -1395,13 +1579,16 @@ function renderSubagentWidget(u: any) {
 	else u.setWidget("z_subagent_tasks", []);
 }
 // 按 taskId / agent / sessionId 模糊匹配运行中的任务（不传参数 = 全部）
-function findRunningTasks(opts: { taskId?: string; agent?: string; sessionId?: string }): { taskId: string; entry: AsyncTaskEntry }[] {
+function findRunningTasks(
+	opts: { taskId?: string; agent?: string; sessionId?: string },
+	force = false,
+): { taskId: string; entry: AsyncTaskEntry }[] {
 	const q = (opts.taskId || "").toLowerCase();
 	const a = (opts.agent || "").toLowerCase();
 	const s = (opts.sessionId || "").toLowerCase();
 	const out: { taskId: string; entry: AsyncTaskEntry }[] = [];
 	const all = new Map(asyncTasks);
-	for (const [id, e] of discoverExternalTasks()) {
+	for (const [id, e] of discoverExternalTasks(force)) {
 		if (!all.has(id)) all.set(id, e);
 	}
 	for (const [id, entry] of all) {
@@ -1410,7 +1597,7 @@ function findRunningTasks(opts: { taskId?: string; agent?: string; sessionId?: s
 		if (!q && !a && !s) { out.push({ taskId: id, entry }); continue; }
 		const mId = q && id.toLowerCase().includes(q);
 		const mAgent = a && entry.agent.toLowerCase().includes(a);
-		const mSess = s && (entry.sessionId || "").toLowerCase().includes(s);
+		const mSess = s && `${entry.sessionId || ""} ${entry.parentSessionId || ""}`.toLowerCase().includes(s);
 		if (mId || mAgent || mSess) out.push({ taskId: id, entry });
 	}
 	return out;
@@ -1420,8 +1607,69 @@ function formatRunningTasks(list: { taskId: string; entry: AsyncTaskEntry }[]): 
 	if (list.length === 0) return "(none)";
 	return list.map(({ taskId, entry }) => {
 		const sess = entry.sessionId ? ` session=${entry.sessionId}` : "";
-		return `- ${taskId} agent=${entry.agent}${sess} task="${entry.task.slice(0, 80)}"`;
+		const parent = entry.parentTaskId
+			? ` parentTask=${entry.parentTaskId}`
+			: entry.parentSessionId ? ` parentSession=${entry.parentSessionId}` : " parent=unknown";
+		return `- ${taskId} agent=${entry.agent}${sess}${parent} task="${entry.task.slice(0, 80)}"`;
 	}).join("\n");
+}
+
+interface TaskRelation {
+	sessionId?: string;
+	parentSessionId?: string;
+	parentTaskId?: string;
+	parentSessionPath?: string;
+	agent?: string;
+}
+
+function discoverTaskRelations(): Map<string, TaskRelation> {
+	const relations = new Map<string, TaskRelation>();
+	let files: string[] = [];
+	try { files = fs.readdirSync(getAgentLogDir()); } catch { return relations; }
+	for (const file of files) {
+		if (!file.startsWith("task-") || !file.endsWith(".jsonl")) continue;
+		const taskId = file.slice(0, -6);
+		const relation: TaskRelation = {};
+		let raw = "";
+		try { raw = readFilePrefix(path.join(getAgentLogDir(), file)); } catch { continue; }
+		for (const line of raw.split("\n").slice(0, 80)) {
+			if (!line.trim()) continue;
+			try {
+				const event = JSON.parse(line);
+				if (event.type === "session" && !relation.sessionId) relation.sessionId = String(event.id || "") || undefined;
+				else if (event.type === "pi_subagent_parent") {
+					relation.parentSessionId = String(event.parentId || "") || relation.parentSessionId;
+					relation.parentTaskId = String(event.parentTaskId || "") || relation.parentTaskId;
+					relation.parentSessionPath = String(event.parentSessionPath || "") || relation.parentSessionPath;
+				} else if (event.type === "pi_subagent_task") relation.agent = String(event.agent || "") || undefined;
+			} catch { /* partial prefix line */ }
+		}
+		relations.set(taskId, relation);
+	}
+	return relations;
+}
+
+function resolveRecursiveStopTargets(opts: {
+	taskId?: string;
+	agent?: string;
+	sessionId?: string;
+}): { taskId: string; entry: AsyncTaskEntry }[] {
+	const allRunning = findRunningTasks({}, true);
+	if (!opts.taskId && !opts.agent && !opts.sessionId) return allRunning;
+
+	const direct = findRunningTasks(opts, true);
+	const rootIds = new Set(direct.map(({ taskId }) => taskId));
+	const relations = discoverTaskRelations();
+	const taskQuery = (opts.taskId || "").toLowerCase();
+	const agentQuery = (opts.agent || "").toLowerCase();
+	const sessionQuery = (opts.sessionId || "").toLowerCase();
+	for (const [taskId, relation] of relations) {
+		if (taskQuery && taskId.toLowerCase().includes(taskQuery)) rootIds.add(taskId);
+		if (agentQuery && (relation.agent || "").toLowerCase().includes(agentQuery)) rootIds.add(taskId);
+		if (sessionQuery && `${relation.sessionId || ""} ${relation.parentSessionId || ""}`.toLowerCase().includes(sessionQuery)) rootIds.add(taskId);
+	}
+	const selected = collectDescendantTaskIds(rootIds, relations);
+	return allRunning.filter(({ taskId }) => selected.has(taskId));
 }
 
 // 按会话 id 找**真实**(非 subagent-task-* 镜像)的 session 文件路径。
@@ -1595,8 +1843,9 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"Modes:",
 			'- single: { agent: "scout", task: "..." } — named agent, or omit agent for a generic worker',
-			'- parallel: { tasks: [...] } — up to 8 agents run concurrently (for cases 1, 4)',
+			'- parallel: { tasks: [...] } — up to 15 tasks (sync execution uses 4 slots; async is capped at 15 active workers)',
 			'- chain: { chain: [...] } — sequential steps, use {previous} for prior output',
+			"Safety: one nested generation is allowed by default; machine-wide active workers are capped at 15.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -1641,7 +1890,7 @@ export default function (pi: ExtensionAPI) {
 						const rmux = await getRmux();
 						if (rmux && entry.rmuxTarget) {
 							const p = await rmux.cmd("list-panes", "-t", entry.rmuxTarget);
-							alive = p.returnCode === 0;
+							alive = p.returnCode === 0 && !(p.stdout?.includes("(dead)") ?? false);
 							extraLine = `\n  Attach: ${entry.rmuxAttachCmd}`;
 						}
 					} catch {}
@@ -1660,6 +1909,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			if (params.tasks) assertBatchWithinLimit("parallel", params.tasks.length, MAX_PARALLEL_TASKS);
+			if (params.chain) assertBatchWithinLimit("chain", params.chain.length, MAX_CHAIN_TASKS);
+
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
@@ -1675,6 +1927,7 @@ export default function (pi: ExtensionAPI) {
 
 			// ── single 模式（默认异步后台执行）──
 			if (hasSingle) {
+				assertSubagentSpawnAllowed();
 				const agentName = params.agent!;
 				// _worker 是动态构造的通用 worker（runAsyncSingleAgent 内支持），不在预注册列表里，需放行
 				if (agentName !== "_worker" && !agents.find((a) => a.name === agentName)) {
@@ -1697,6 +1950,7 @@ export default function (pi: ExtensionAPI) {
 
 			// ── auto 模式（不指定 agent，自动用通用 worker）──
 			if (hasAuto) {
+				assertSubagentSpawnAllowed();
 				const taskId = await runAsyncSingleAgent(ctx.cwd, dispatchDefaults, agents, "_worker", params.task!, ctx.ui);
 				const entry = asyncTasks.get(taskId);
 				const rmuxLine = entry?.useRmux && entry?.rmuxAttachCmd
@@ -1736,6 +1990,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
+				assertSubagentSpawnAllowed();
 				const results: SingleResult[] = [];
 				let previousOutput = "";
 
@@ -1789,8 +2044,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// ── parallel 模式（默认异步后台执行）──
-			if (params.tasks && params.tasks.length > 0 && (params.async ?? true)) {
+			// ── parallel 模式（async=true 时后台执行；默认同步等待）──
+			if (params.tasks && params.tasks.length > 0 && shouldRunSubagentsAsync(params.async)) {
+				assertSubagentSpawnAllowed();
 				// 先校验所有 agent（与 single 模式一致）：无效 agent 直接报错，
 				// 不要假装提交（之前 runAsyncSingleAgent 返回空串时仍报
 				// “N task(s) submitted: scout ()”，worker 根本没启动）。
@@ -1808,11 +2064,15 @@ export default function (pi: ExtensionAPI) {
 				const ids: string[] = [];
 				const failures: string[] = [];
 				for (const t of params.tasks) {
-					const taskId = await runAsyncSingleAgent(ctx.cwd, dispatchDefaults, agents, t.agent, t.task, ctx.ui);
-					if (taskId) {
-						ids.push(`${t.agent} (${taskId})`);
-					} else {
-						failures.push(`"${t.agent}"`);
+					try {
+						const taskId = await runAsyncSingleAgent(ctx.cwd, dispatchDefaults, agents, t.agent, t.task, ctx.ui);
+						if (taskId) ids.push(`${t.agent} (${taskId})`);
+						else failures.push(`"${t.agent}" (not found)`);
+					} catch (error) {
+						failures.push(`"${t.agent}" (${String((error as any)?.message || error)})`);
+						// A global-cap failure will repeat for every remaining item. Stop
+						// attempting admission, but report all task IDs already submitted.
+						break;
 					}
 				}
 				const text =
@@ -1827,16 +2087,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
+				assertSubagentSpawnAllowed();
 
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
@@ -1868,24 +2119,37 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
+					let result: SingleResult;
+					try {
+						result = await runSingleAgent(
+							ctx.cwd,
+							dispatchDefaults,
+							agents,
+							t.agent,
+							t.task,
+							t.cwd,
+							undefined,
+							signal,
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+						);
+					} catch (error) {
+						result = {
+							agent: t.agent,
+							agentSource: "unknown",
+							task: t.task,
+							exitCode: 1,
+							messages: [],
+							stderr: String((error as any)?.message || error),
+							usage: { ...ZERO_USAGE },
+						};
+					}
 					allResults[index] = result;
 					emitParallelUpdate();
 					return result;
@@ -2246,6 +2510,7 @@ export default function (pi: ExtensionAPI) {
 		resumeSessionId?: string,  // 若提供，则用 --session <id> 重连既有会话而非新建
 		registryTaskText?: string,  // reload 时保留原始任务文本，避免续作提示中的讨论ID污染 item gate
 	): Promise<string> => {
+		assertSubagentSpawnAllowed();
 		let agent = agents.find((a) => a.name === agentName);
 		// _worker: 通用 worker，不依赖预注册 agent
 		if (!agent && agentName === "_worker") {
@@ -2282,6 +2547,7 @@ export default function (pi: ExtensionAPI) {
 			fs.writeFileSync(logPath, "", { encoding: "utf-8", mode: 0o600 });
 		} catch {}
 		appendTaskMetadata(logPath, taskId, agentName, taskText, cwd);
+		appendTaskLineage(logPath);
 
 		// shell 安全地拼接参数，处理空格和引号
 		const shellQuote = (s: string) => s.match(/^[a-zA-Z0-9_./-]+$/) ? s : `'${s.replace(/'/g, "'\\''")}'`;
@@ -2305,12 +2571,10 @@ export default function (pi: ExtensionAPI) {
 				const filterScript = getJsonlFilterPath();
 				const sessionPath = getSubagentSessionPath(taskId, cwd);
 				try { fs.writeFileSync(sessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
-				const contextEnv = inheritedContextEnv(dispatch.contextWindow);
-				const contextExport = contextEnv.PI_SUBAGENT_CONTEXT_WINDOW
-					? ` PI_SUBAGENT_CONTEXT_WINDOW=${shellQuote(contextEnv.PI_SUBAGENT_CONTEXT_WINDOW)}`
-					: "";
+				const childEnv = subagentChildEnv(taskId, dispatch.contextWindow);
+				const childExports = shellEnvAssignments(childEnv, shellQuote);
 				const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-					`export PI_SUBAGENT_TASK_ID=${shellQuote(taskId)}${contextExport} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
+					`export ${childExports} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
 
 				if (r.returnCode === 0) {
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
@@ -2319,6 +2583,8 @@ export default function (pi: ExtensionAPI) {
 						agent: agentName, task: taskText, proc: dummyProc, startTime: Date.now(),
 						useRmux: true, rmuxTarget, rmuxAttachCmd: attachCmd,
 						cwd, sessionId: resumeSessionId || undefined,
+						parentSessionId: currentSessionId || undefined,
+						parentTaskId: process.env.PI_SUBAGENT_TASK_ID || undefined,
 					});
 
 					const cleanup = () => {
@@ -2338,6 +2604,9 @@ export default function (pi: ExtensionAPI) {
 							const isDead = panes.returnCode !== 0 || (panes.stdout?.includes("(dead)") ?? false);
 							if (isDead) {
 								clearInterval(pollInterval);
+								if (panes.returnCode === 0) {
+									try { await rmux.cmd("kill-window", "-t", rmuxTarget.split(".")[0]); } catch {}
+								}
 								handleCompletion();
 								return;
 							}
@@ -2407,7 +2676,7 @@ export default function (pi: ExtensionAPI) {
 		const proc = spawn(process.execPath, [process.argv[1]!, ...piArgs], {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, PI_SUBAGENT_TASK_ID: taskId, ...inheritedContextEnv(dispatch.contextWindow) },
+			env: { ...process.env, ...subagentChildEnv(taskId, dispatch.contextWindow) },
 		});
 		const fbSessionPath = getSubagentSessionPath(taskId, cwd);
 		try { fs.writeFileSync(fbSessionPath, "", { encoding: "utf-8", mode: 0o600 }); } catch {}
@@ -2416,6 +2685,8 @@ export default function (pi: ExtensionAPI) {
 			agent: agentName, task: taskText, proc, startTime: Date.now(),
 			useRmux: false,
 			cwd, sessionId: resumeSessionId || undefined,
+			parentSessionId: currentSessionId || undefined,
+			parentTaskId: process.env.PI_SUBAGENT_TASK_ID || undefined,
 		});
 
 		let rawStdout = "";
@@ -2577,10 +2848,8 @@ export default function (pi: ExtensionAPI) {
 		const agentName = agents.some((agent) => agent.name === requestedAgent)
 			? requestedAgent
 			: "_worker";
-		// Match reloadTask: a bare id is ambiguous because every task mirror keeps
-		// the child session id in its header.  If pi resolves a mirror first, the
-		// resumed process appends there while the canonical session stays stale,
-		// and desktop/plugin session-id de-duplication hides the continuation.
+		// A bare id is ambiguous because task mirrors carry the same child
+		// session id. Resume the verified canonical non-mirror file instead.
 		const resumeTarget = resolveResumeTarget(path.join(getAgentDir(), "sessions"), sessionId);
 		return runAsyncSingleAgent(
 			cwd,
@@ -2752,18 +3021,44 @@ export default function (pi: ExtensionAPI) {
 		description: "List currently running subagents with their task id, agent name, pi session id and task description. Use this to identify which subagent to kill/reload.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const all = findRunningTasks({});
+			const all = findRunningTasks({}, true);
 			const lines = all.map(({ taskId, entry }) => {
 				const actualSessionId = getTaskSessionId(taskId);
 				if (actualSessionId) entry.sessionId = actualSessionId;
 				if (!entry.usage || !entry.usage.turns) accumulateTaskUsage(taskId, entry);
 				const sess = entry.sessionId ? ` session=${entry.sessionId}` : "";
-				return `- ${taskId} agent=${entry.agent}${sess} rmux=${entry.useRmux ? "yes" : "no"}${fmtUsageShort(entry.usage)} task="${entry.task.slice(0, 100)}"`;
+				const parent = entry.parentTaskId
+					? ` parentTask=${entry.parentTaskId}`
+					: entry.parentSessionId ? ` parentSession=${entry.parentSessionId}` : " parent=unknown";
+				return `- ${taskId} agent=${entry.agent}${sess}${parent} rmux=${entry.useRmux ? "yes" : "no"}${fmtUsageShort(entry.usage)} task="${entry.task.slice(0, 100)}"`;
 			});
 			void ctx;
 			return {
 				content: [{ type: "text", text: all.length ? lines.join("\n") : "No running subagents." }],
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_gc",
+		label: "Subagent GC",
+		description: "Find or remove completed rmux panes retained by durable subagents. Only pane_dead=1 windows are eligible; live workers are never touched.",
+		parameters: Type.Object({
+			dryRun: Type.Optional(Type.Boolean({ description: "Only count dead panes without removing them. Default: false.", default: false })),
+		}),
+		async execute(_toolCallId, params) {
+			const result = await cleanupDeadRmuxWindows(params.dryRun ?? false);
+			return { content: [{ type: "text", text: params.dryRun
+				? `${result.found} dead subagent pane(s) found; nothing removed.`
+				: `${result.removed}/${result.found} dead subagent pane(s) removed; live workers untouched.` }] };
+		},
+	});
+
+	pi.registerCommand("agent:gc", {
+		description: "Remove completed/dead durable subagent rmux panes without touching live workers",
+		handler: async (_args, ctx) => {
+			const result = await cleanupDeadRmuxWindows(false);
+			ctx.ui.notify(`${result.removed}/${result.found} dead subagent pane(s) removed; live workers untouched.`, "info");
 		},
 	});
 
@@ -2831,27 +3126,47 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_stop",
 		label: "Subagent Stop",
-		description: "Kill a running subagent WITHOUT resuming it. Its session file is preserved, so it can be resumed later (e.g. via /agent:resume or subagent_reload with sessionId). Identify by taskId / agent / sessionId; if none given, all running subagents are stopped.",
+		description: "Kill running subagents without resuming them. Selecting a task/session recursively stops all descendants by default. With no selector, performs a fast machine-wide emergency stop, including the shared rmux session. Session files are preserved.",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String({ description: "Task id or substring" })),
 			agent: Type.Optional(Type.String({ description: "Agent name" })),
 			sessionId: Type.Optional(Type.String({ description: "Pi session id" })),
+			recursive: Type.Optional(Type.Boolean({ description: "Also stop descendant tasks. Default: true.", default: true })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const running = findRunningTasks({ taskId: params.taskId, agent: params.agent, sessionId: params.sessionId });
+			const hasSelector = Boolean(params.taskId || params.agent || params.sessionId);
+			const selector = { taskId: params.taskId, agent: params.agent, sessionId: params.sessionId };
+			const running = !hasSelector
+				? findRunningTasks({}, true)
+				: params.recursive === false
+					? findRunningTasks(selector, true)
+					: resolveRecursiveStopTargets(selector);
+			if (!hasSelector) {
+				return { content: [{ type: "text", text: await emergencyStopAll(running) }] };
+			}
 			if (running.length === 0) {
-				const all = findRunningTasks({});
+				const all = findRunningTasks({}, true);
 				return {
 					content: [{ type: "text", text: `No running subagent matched. Running subagents:\n${formatRunningTasks(all)}` }],
 				};
 			}
-			const results: string[] = [];
-			for (const { taskId, entry } of running) {
-				const ok = await killTask(taskId);
-				results.push(`${ok ? "✓" : "✗"} ${taskId} (${entry.agent}) ${ok ? "killed" : "kill failed"}`);
-			}
+			const results = await mapWithConcurrencyLimit(running, MAX_CONCURRENCY, async ({ taskId, entry }) => {
+				const ok = await killTask(taskId, entry);
+				return `${ok ? "✓" : "✗"} ${taskId} (${entry.agent}) ${ok ? "killed" : "kill failed"}`;
+			});
 			void ctx;
-			return { content: [{ type: "text", text: results.join("\n") }] };
+			const shown = results.slice(0, 50);
+			if (results.length > shown.length) shown.push(`… ${results.length - shown.length} additional result(s) omitted`);
+			return { content: [{ type: "text", text: shown.join("\n") }] };
+		},
+	});
+
+	pi.registerCommand("agent:stop-all", {
+		description: "Emergency stop every running durable subagent immediately",
+		handler: async (_args, ctx) => {
+			const running = findRunningTasks({}, true);
+			const message = await emergencyStopAll(running);
+			ctx.ui.notify(message, "warning");
 		},
 	});
 
@@ -2932,8 +3247,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		const safety = readSubagentSafetyConfig();
+		if (process.env.PI_SUBAGENT_TASK_ID) {
+			try { process.title = `pi-subagent-${process.env.PI_SUBAGENT_TASK_ID}`.slice(0, 120); } catch {}
+		}
+		if (safety.depth >= safety.maxDepth) {
+			const activeTools = pi.getActiveTools();
+			if (activeTools.includes("subagent")) {
+				pi.setActiveTools(activeTools.filter((name) => name !== "subagent"));
+			}
+		}
+		ensureWorkerOwnershipHeartbeat();
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
+		currentSessionFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
 		// Completion callbacks from a pre-/reload or pre-/new extension instance
 		// survive with asyncTasks. Route them through the newest session API.
 		(globalThis as any)[GLOBAL_COMPLETION_SENDER_KEY] = (body: string) =>
@@ -2947,13 +3274,14 @@ export default function (pi: ExtensionAPI) {
 		const g = globalThis as any;
 		g.__pi_subagent_ui__ = ctx.ui;
 		g.__pi_subagent_sid__ = currentSessionId;
+		g.__pi_subagent_sfile__ = currentSessionFile;
 		// 自注册(两通道):
 		// 1. pid 注册表(私有槽,直连):每个 pi 写 ~/.pi/agent/runtime/<pid>.jsonl,
 		//    桌面端按 pid/panePid 精确查表归属——无共享可变状态,终端 pi 也有
 		//    条目(R1 多终端 pi 结构性解决)。
 		// 2. @pi_session 窗口选项(共享槽,兜底):仅 tmux 内注册,旧版桌面端兼容。
 		try {
-			const sessFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
+			const sessFile = currentSessionFile;
 			let win = "";
 			let panePid: number | null = null;
 			let tty = "";
@@ -3030,6 +3358,7 @@ export default function (pi: ExtensionAPI) {
 		if (g.__pi_subagent_ui__) sessionUI = g.__pi_subagent_ui__;
 		if (g.__pi_subagent_sid__) currentSessionId = g.__pi_subagent_sid__;
 		const sfile = g.__pi_subagent_sfile__ || "";
+		if (sfile) currentSessionFile = sfile;
 		if (sfile) {
 			try {
 				const win = execSync("rmux display-message -p '#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
