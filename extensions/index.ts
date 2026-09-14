@@ -42,6 +42,7 @@ import {
 	assertSubagentSpawnAllowed,
 	childSubagentEnvironment,
 	collectDescendantTaskIds,
+	allowedManagementTaskIds,
 	parseRmuxTaskPanes,
 	readSubagentSafetyConfig,
 	shouldRunSubagentsAsync,
@@ -51,6 +52,7 @@ import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume
 
 // ── RMUX integration ──
 const RMUX_SESSION_NAME = "pi-agents";
+const CURRENT_WORKER_TASK_ID = process.env.PI_SUBAGENT_TASK_ID || "";
 let rmuxAvailable: boolean | null = null;
 let rmuxClient: any = null; // Rmux instance (lazy)
 
@@ -359,6 +361,17 @@ function extractStopReason(raw: string): string | undefined {
 		} catch {}
 	}
 	return last;
+}
+
+function hasTerminalAgentEvent(raw: string): boolean {
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const type = JSON.parse(line)?.type;
+			if (type === "agent_end" || type === "agent_settled") return true;
+		} catch {}
+	}
+	return false;
 }
 
 function extractErrorMessage(raw: string): string | undefined {
@@ -1341,6 +1354,10 @@ function getTaskParentSessionId(taskId: string): string | null {
 // 注意：entry 可能来自本进程 asyncTasks（自己 spawn 的），也可能来自
 // discoverExternalTasks（父 pi 已死/其他 pi spawn 的孤儿），两种都要能杀。
 async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<boolean> {
+	if (CURRENT_WORKER_TASK_ID && taskId === CURRENT_WORKER_TASK_ID) {
+		diagLog(`REFUSED self-kill task=${taskId}`);
+		return false;
+	}
 	const entry = knownEntry || asyncTasks.get(taskId) || discoverExternalTasks(true).get(taskId);
 	if (!entry) return false;
 	entry.intentionalKill = true;
@@ -1662,6 +1679,32 @@ function discoverTaskRelations(): Map<string, TaskRelation> {
 		relations.set(taskId, relation);
 	}
 	return relations;
+}
+
+function managementScopeForCurrentWorker(): Set<string> | null {
+	if (!CURRENT_WORKER_TASK_ID) return null;
+	const relations = discoverTaskRelations();
+	for (const { taskId, entry } of findRunningTasks({}, true)) {
+		const current = relations.get(taskId) || {};
+		relations.set(taskId, {
+			...current,
+			sessionId: current.sessionId || entry.sessionId,
+			parentSessionId: current.parentSessionId || entry.parentSessionId,
+			parentTaskId: current.parentTaskId || entry.parentTaskId,
+		});
+	}
+	return allowedManagementTaskIds(CURRENT_WORKER_TASK_ID, relations);
+}
+
+function restrictManagementTargets(
+	targets: { taskId: string; entry: AsyncTaskEntry }[],
+): { allowed: { taskId: string; entry: AsyncTaskEntry }[]; blocked: string[] } {
+	const scope = managementScopeForCurrentWorker();
+	if (scope === null) return { allowed: targets, blocked: [] };
+	return {
+		allowed: targets.filter(({ taskId }) => scope.has(taskId)),
+		blocked: targets.filter(({ taskId }) => !scope.has(taskId)).map(({ taskId }) => taskId),
+	};
 }
 
 function resolveRecursiveStopTargets(opts: {
@@ -2650,6 +2693,7 @@ export default function (pi: ExtensionAPI) {
 						const finalText = extractAssistantFinalText(rawOutput);
 						const stopReason = extractStopReason(rawOutput);
 						const errorMessage = extractErrorMessage(rawOutput);
+						const interruptedWithoutTerminal = !hasTerminalAgentEvent(rawOutput);
 
 						cleanup();
 						updateWidget();
@@ -2657,23 +2701,27 @@ export default function (pi: ExtensionAPI) {
 							const resultKey = `agent:${agentName}:${taskId}`;
 							const summary = stopReason === "error"
 								? `interrupted (${stopReason}): ${(errorMessage || finalText || "model/provider error, no text output").slice(0, 500)}`
-								: finalText
-									? finalText.slice(0, 500)
-									: "(no output)";
+								: interruptedWithoutTerminal
+									? `interrupted before agent_end: ${(finalText || "process exited during a tool call").slice(0, 500)}`
+									: finalText
+										? finalText.slice(0, 500)
+										: "(no output)";
 							persistResultEntry({
 								key: resultKey,
-								value: { agent: agentName, task: taskText, exitCode: 0, output: finalText, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() },
+								value: { agent: agentName, task: taskText, exitCode: interruptedWithoutTerminal ? 1 : 0, output: finalText, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() },
 							});
 						} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
 						try {
 							const usageLine = usage && usage.turns > 0
 								? (usage.contextWindow ? ` [ctx ${((usage.contextTokens / usage.contextWindow) * 100).toFixed(1)}%/${fmtCompact(usage.contextWindow)}]` : ` [ctx ${fmtCompact(usage.contextTokens)}]`)
 								: "";
-							const body = finalText
-								? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
-								: stopReason === "error"
-									? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：${(errorMessage || "model/provider error").slice(0, 1200)}\n可用 subagent_reload 恢复；恢复时会继承当前主会话模型。`
-									: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
+							const body = stopReason === "error"
+								? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：${(errorMessage || "model/provider error").slice(0, 1200)}\n可用 subagent_reload 恢复；恢复时会继承当前主会话模型。`
+								: interruptedWithoutTerminal
+									? `Agent "${agentName}" (${taskId}) 异常中断${usageLine}：进程在 agent_end/agent_settled 前退出${finalText ? `；最后文本：${finalText.slice(0, 1000)}` : "，可能死于未完成的工具调用"}。会话仍可恢复。`
+									: finalText
+										? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
+										: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出。可用 /agent-results 查看。`;
 							sendCompletionToCurrentSession(pi, body);
 						} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 					};
@@ -2757,18 +2805,21 @@ export default function (pi: ExtensionAPI) {
 			const finalText = extractAssistantFinalText(rawStdout);
 			const stopReason = extractStopReason(rawStdout);
 			const errorMessage = extractErrorMessage(rawStdout);
+			const interruptedWithoutTerminal = !hasTerminalAgentEvent(rawStdout);
 			cleanupFallback();
 			updateWidget();
 			try {
 				const resultKey = `agent:${agentName}:${taskId}`;
 				const summary = stopReason === "error"
 					? `interrupted (${stopReason}): ${(errorMessage || finalText || "model/provider error, no text output").slice(0, 500)}`
-					: code === 0
-						? (finalText || "(no output)").slice(0, 500)
-						: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
+					: interruptedWithoutTerminal
+						? `interrupted before agent_end: ${(finalText || stderr || "process exited during a tool call").slice(0, 500)}`
+						: code === 0
+							? (finalText || "(no output)").slice(0, 500)
+							: `failed (exit: ${code}): ${stderr.slice(0, 200)}`;
 				persistResultEntry({
 					key: resultKey,
-					value: { agent: agentName, task: taskText, exitCode: code, output: finalText || stderr, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() },
+					value: { agent: agentName, task: taskText, exitCode: interruptedWithoutTerminal && code === 0 ? 1 : code, output: finalText || stderr, summary, usage: usage ? { totalTokens: usage.totalTokens, cost: usage.cost, contextTokens: usage.contextTokens, contextWindow: usage.contextWindow } : undefined, timestamp: Date.now() },
 				});
 			} catch (e) { console.warn("[subagent] appendEntry failed:", e); }
 			if (code === 0) {
@@ -2776,11 +2827,13 @@ export default function (pi: ExtensionAPI) {
 					const usageLine = usage && usage.turns > 0
 						? (usage.contextWindow ? ` [ctx ${((usage.contextTokens / usage.contextWindow) * 100).toFixed(1)}%/${fmtCompact(usage.contextWindow)}]` : ` [ctx ${fmtCompact(usage.contextTokens)}]`)
 						: "";
-					const body = finalText
-						? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
-						: stopReason === "error"
-							? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：${(errorMessage || "model/provider error").slice(0, 1200)}\n可用 subagent_reload 恢复；恢复时会继承当前主会话模型。`
-							: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出（可能只执行了工具调用就结束）。可用 /agent-results 查看，或 subagent_reload 继续。`;
+					const body = stopReason === "error"
+						? `Agent "${agentName}" (${taskId}) 任务中断${usageLine}：${(errorMessage || "model/provider error").slice(0, 1200)}\n可用 subagent_reload 恢复；恢复时会继承当前主会话模型。`
+						: interruptedWithoutTerminal
+							? `Agent "${agentName}" (${taskId}) 异常中断${usageLine}：进程在 agent_end/agent_settled 前退出${finalText ? `；最后文本：${finalText.slice(0, 1000)}` : "，可能死于未完成的工具调用"}。会话仍可恢复。`
+							: finalText
+								? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
+								: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出。可用 /agent-results 查看。`;
 					sendCompletionToCurrentSession(pi, body);
 				} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 			}
@@ -3033,10 +3086,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_list",
 		label: "Subagent List",
-		description: "List currently running subagents with their task id, agent name, pi session id and task description. Use this to identify which subagent to kill/reload.",
+		description: "List currently running subagents with their task id, agent name, pi session id and task description. Main sessions see all workers; worker callers see only descendants they are allowed to manage. The current worker is never returned as its own subagent.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const all = findRunningTasks({}, true);
+			const discovered = findRunningTasks({}, true);
+			const scope = managementScopeForCurrentWorker();
+			const all = scope === null ? discovered : discovered.filter(({ taskId }) => scope.has(taskId));
 			const lines = all.map(({ taskId, entry }) => {
 				const actualSessionId = getTaskSessionId(taskId);
 				if (actualSessionId) entry.sessionId = actualSessionId;
@@ -3049,7 +3104,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			void ctx;
 			return {
-				content: [{ type: "text", text: all.length ? lines.join("\n") : "No running subagents." }],
+				content: [{ type: "text", text: all.length
+					? lines.join("\n")
+					: CURRENT_WORKER_TASK_ID
+						? `No running descendant subagents. Current worker ${CURRENT_WORKER_TASK_ID} cannot stop/reload itself.`
+						: "No running subagents." }],
 			};
 		},
 	});
@@ -3092,7 +3151,7 @@ export default function (pi: ExtensionAPI) {
 			"- agent: agent name, e.g. 'scout'",
 			"- sessionId: pi session id, e.g. '019f...'",
 			"- If none given, ALL running subagents are reloaded.",
-			"Run subagent_list first if unsure which subagent matches.",
+			"Run subagent_list first if unsure which subagent matches. Worker callers may reload descendants only; self/ancestor/sibling and selector-free reload are refused.",
 		].join(" "),
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String({ description: "Task id or substring of a running subagent" })),
@@ -3104,9 +3163,23 @@ export default function (pi: ExtensionAPI) {
 			const dispatchDefaults = dispatchDefaultsFromContext(ctx);
 			const defaultPrompt = "你被主 agent 重新连接了（工具/环境可能已更新）。请先简要总结当前进度，然后继续完成你之前的任务。";
 			const prompt = (params.prompt || "").trim() || defaultPrompt;
-			const running = findRunningTasks({ taskId: params.taskId, agent: params.agent, sessionId: params.sessionId });
+			const hasSelector = Boolean(params.taskId || params.agent || params.sessionId);
+			if (CURRENT_WORKER_TASK_ID && !hasSelector) {
+				return { content: [{ type: "text", text: `REFUSED: worker ${CURRENT_WORKER_TASK_ID} cannot perform selector-free reload.` }] };
+			}
+			const requested = findRunningTasks({ taskId: params.taskId, agent: params.agent, sessionId: params.sessionId });
+			const restricted = restrictManagementTargets(requested);
+			if (CURRENT_WORKER_TASK_ID && restricted.blocked.length) {
+				return { content: [{ type: "text", text: `REFUSED: worker ${CURRENT_WORKER_TASK_ID} may reload descendants only; blocked targets: ${restricted.blocked.join(", ")}.` }] };
+			}
+			const running = restricted.allowed;
 			if (running.length === 0) {
-				// 没有运行中的匹配：尝试直接重连暂停/已结束的 session（不 kill）
+				// Worker callers cannot resume arbitrary finished sessions: lineage may be
+				// ambiguous and self-resume would terminate the caller mid-tool.
+				if (CURRENT_WORKER_TASK_ID) {
+					return { content: [{ type: "text", text: `No running descendant subagent matched. Current worker ${CURRENT_WORKER_TASK_ID} cannot reload itself, ancestors, siblings, or arbitrary finished sessions.` }] };
+				}
+				// 没有运行中的匹配：main session 尝试直接重连暂停/已结束的 session（不 kill）
 				const sid = (params.sessionId || "").trim();
 				const q = (params.taskId || "").trim();
 				if (sid) {
@@ -3141,7 +3214,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_stop",
 		label: "Subagent Stop",
-		description: "Kill running subagents without resuming them. Selecting a task/session recursively stops all descendants by default. With no selector, performs a fast machine-wide emergency stop, including the shared rmux session. Session files are preserved.",
+		description: "Kill running subagents without resuming them. Main sessions may select any task or use selector-free machine-wide emergency stop. Worker callers may stop descendants only; self/ancestor/sibling and selector-free stop are refused. Session files are preserved.",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String({ description: "Task id or substring" })),
 			agent: Type.Optional(Type.String({ description: "Agent name" })),
@@ -3150,19 +3223,31 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const hasSelector = Boolean(params.taskId || params.agent || params.sessionId);
+			if (CURRENT_WORKER_TASK_ID && !hasSelector) {
+				return { content: [{ type: "text", text: `REFUSED: worker ${CURRENT_WORKER_TASK_ID} cannot perform selector-free machine-wide stop.` }] };
+			}
 			const selector = { taskId: params.taskId, agent: params.agent, sessionId: params.sessionId };
-			const running = !hasSelector
+			const requested = !hasSelector
 				? findRunningTasks({}, true)
 				: params.recursive === false
 					? findRunningTasks(selector, true)
 					: resolveRecursiveStopTargets(selector);
+			const restricted = restrictManagementTargets(requested);
+			if (CURRENT_WORKER_TASK_ID && restricted.blocked.length) {
+				return { content: [{ type: "text", text: `REFUSED: worker ${CURRENT_WORKER_TASK_ID} may stop descendants only; blocked targets: ${restricted.blocked.join(", ")}.` }] };
+			}
+			const running = restricted.allowed;
 			if (!hasSelector) {
 				return { content: [{ type: "text", text: await emergencyStopAll(running) }] };
 			}
 			if (running.length === 0) {
 				const all = findRunningTasks({}, true);
+				const scope = managementScopeForCurrentWorker();
+				const visible = scope === null ? all : all.filter(({ taskId }) => scope.has(taskId));
 				return {
-					content: [{ type: "text", text: `No running subagent matched. Running subagents:\n${formatRunningTasks(all)}` }],
+					content: [{ type: "text", text: CURRENT_WORKER_TASK_ID
+						? `No running descendant subagent matched. Current worker ${CURRENT_WORKER_TASK_ID} cannot stop itself. Manageable descendants:\n${formatRunningTasks(visible)}`
+						: `No running subagent matched. Running subagents:\n${formatRunningTasks(visible)}` }],
 				};
 			}
 			const results = await mapWithConcurrencyLimit(running, MAX_CONCURRENCY, async ({ taskId, entry }) => {
@@ -3177,8 +3262,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("agent:stop-all", {
-		description: "Emergency stop every running durable subagent immediately",
+		description: "Emergency stop every running durable subagent immediately (main sessions only)",
 		handler: async (_args, ctx) => {
+			if (CURRENT_WORKER_TASK_ID) {
+				ctx.ui.notify(`REFUSED: worker ${CURRENT_WORKER_TASK_ID} cannot issue machine-wide stop.`, "error");
+				return;
+			}
 			const running = findRunningTasks({}, true);
 			const message = await emergencyStopAll(running);
 			ctx.ui.notify(message, "warning");

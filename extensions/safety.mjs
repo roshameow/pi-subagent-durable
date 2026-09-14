@@ -84,3 +84,13 @@ export function collectDescendantTaskIds(rootTaskIds, relations) {
   }
   return selected;
 }
+
+// A worker may manage only its descendants. It must never stop/reload itself,
+// an ancestor, a sibling, or every machine-wide task. Main sessions have no
+// PI_SUBAGENT_TASK_ID and are intentionally unrestricted here.
+export function allowedManagementTaskIds(currentWorkerTaskId, relations) {
+  if (!currentWorkerTaskId) return null;
+  const allowed = collectDescendantTaskIds(new Set([currentWorkerTaskId]), relations);
+  allowed.delete(currentWorkerTaskId);
+  return allowed;
+}

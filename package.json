@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent-durable",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Durable background subagents for pi: RMUX persistent panes, full session persistence with kill/resume, LLM-manageable (list/reload/stop), context usage stats, slim event logs.",
   "keywords": [
     "pi-package",
@@ -18,7 +18,7 @@
     "url": "https://github.com/yourname/pi-subagent-durable.git"
   },
   "scripts": {
-    "check": "rm -rf /tmp/pi-subagent-durable-check && npx esbuild extensions/index.ts extensions/context-inherit.ts --bundle --platform=node --format=esm --external:@earendil-works/* --external:@rmux/* --external:typebox --outdir=/tmp/pi-subagent-durable-check && node tests/identity.test.mjs && node tests/dispatch.test.mjs && node tests/session-resume.test.mjs && node tests/safety.test.mjs && node tests/ownership-registry.test.mjs && node tests/context-inherit.test.mjs"
+    "check": "rm -rf /tmp/pi-subagent-durable-check && npx esbuild extensions/index.ts extensions/context-inherit.ts --bundle --platform=node --format=esm --external:@earendil-works/* --external:@rmux/* --external:typebox --outdir=/tmp/pi-subagent-durable-check && node tests/identity.test.mjs && node tests/dispatch.test.mjs && node tests/session-resume.test.mjs && node tests/safety.test.mjs && node tests/self-management-regression.test.mjs && node tests/ownership-registry.test.mjs && node tests/context-inherit.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

@@ -4,6 +4,7 @@ import {
   assertSubagentSpawnAllowed,
   childSubagentEnvironment,
   collectDescendantTaskIds,
+  allowedManagementTaskIds,
   parseRmuxTaskPanes,
   readSubagentSafetyConfig,
   shouldRunSubagentsAsync,
@@ -56,5 +57,11 @@ assert.deepEqual(
   [...collectDescendantTaskIds(new Set(["root"]), relations)].sort(),
   ["child", "grandchild", "root"],
 );
+assert.deepEqual(
+  [...allowedManagementTaskIds("root", relations)].sort(),
+  ["child", "grandchild"],
+  "a worker may manage descendants but never itself or unrelated tasks",
+);
+assert.equal(allowedManagementTaskIds("", relations), null, "main sessions are unrestricted");
 
-console.log("OK: nesting guard, child depth propagation, and recursive task selection");
+console.log("OK: nesting guard, child depth propagation, and self-management protection");
