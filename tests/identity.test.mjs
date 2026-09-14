@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { extractItemIds, extractItemKeys } from "../extensions/identity.mjs";
+import { extractItemIds, extractItemKeys, workerControlItemKey, workerItemKeys } from "../extensions/identity.mjs";
 
 assert.deepEqual(extractItemIds("itemId=168373。处理返修；discussion 414557"), ["168373"]);
 assert.deepEqual(extractItemIds("继续处理\nitemId: 175906，历史题目 173685"), ["175906"]);
@@ -10,4 +10,10 @@ assert.deepEqual(extractItemKeys("itemKey: mission:hkg_super_v13\nalpha KPO237EN
 assert.deepEqual(extractItemKeys("itemKey=alpha:KPO237EN"), ["alpha:KPO237EN"]);
 assert.deepEqual(extractItemIds("itemKey=alpha:KPO237EN"), []);
 assert.deepEqual(extractItemKeys("itemKey=../../unsafe"), []);
-console.log("OK: worker identity supports safe generic itemKey and legacy itemId");
+assert.equal(workerControlItemKey("task-mu123"), "worker:task-mu123");
+assert.deepEqual(
+  workerItemKeys("task-mu123", "itemKey: alpha:KPO237EN"),
+  ["worker:task-mu123", "alpha:KPO237EN"],
+);
+assert.deepEqual(workerItemKeys("task-mu123", "no domain key"), ["worker:task-mu123"]);
+console.log("OK: every worker has a default control key plus optional domain itemKey");

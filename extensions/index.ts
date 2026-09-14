@@ -31,7 +31,7 @@ import {
 import { Container, Markdown, Spacer, Text, type Focusable, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { extractItemKeys } from "./identity.mjs";
+import * as identityHelpers from "./identity.mjs";
 import {
 	heartbeatWorkerOwnerships,
 	registerWorkerOwnership,
@@ -214,13 +214,28 @@ function workerOwnerships(): Map<string, string> {
 	return g[OWNERSHIP_MAP_KEY];
 }
 
+// During /reload, Node may retain a cached identity module from an older
+// extension generation. Keep the control channel available even when the new
+// workerItemKeys export has not appeared in that cache yet.
+function resolveWorkerItemKeys(taskId: string, taskText?: string): string[] {
+	if (typeof (identityHelpers as any).workerItemKeys === "function") {
+		return (identityHelpers as any).workerItemKeys(taskId, taskText);
+	}
+	const extract = typeof (identityHelpers as any).extractItemKeys === "function"
+		? (identityHelpers as any).extractItemKeys
+		: typeof (identityHelpers as any).extractItemIds === "function"
+			? (identityHelpers as any).extractItemIds
+			: () => [];
+	return [...new Set([`worker:${taskId}`, ...extract(taskText)])];
+}
+
 function registerWorker(taskId: string, cwd: string, taskText?: string): void {
 	const ownerships = workerOwnerships();
 	if (workerLogIsSettled(taskId)) {
 		unregisterWorker(taskId);
 		return;
 	}
-	const itemKeys = extractItemKeys(taskText);
+	const itemKeys = resolveWorkerItemKeys(taskId, taskText);
 	const ownerToken = ownerships.get(taskId) || crypto.randomUUID();
 	registerWorkerOwnership(getWorkerRegistryPath(), {
 		taskId,

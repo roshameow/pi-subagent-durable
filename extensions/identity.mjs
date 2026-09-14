@@ -4,6 +4,16 @@ export function isSafeItemKey(value) {
   return typeof value === "string" && SAFE_ITEM_KEY.test(value) && value !== "." && value !== ".." && !value.includes("//");
 }
 
+export function workerControlItemKey(taskId) {
+  const key = `worker:${String(taskId || "")}`;
+  if (!isSafeItemKey(key)) throw new Error(`unsafe worker control itemKey: ${key}`);
+  return key;
+}
+
+export function workerItemKeys(taskId, taskText = "") {
+  return [...new Set([workerControlItemKey(taskId), ...extractItemKeys(taskText)])];
+}
+
 export function extractItemKeys(taskText = "") {
   const text = taskText || "";
   // Prefer an explicit domain-neutral declaration. Keys may identify an alpha,

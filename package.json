@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent-durable",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Durable background subagents for pi: RMUX persistent panes, full session persistence with kill/resume, LLM-manageable (list/reload/stop), context usage stats, slim event logs.",
   "keywords": [
     "pi-package",
