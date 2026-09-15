@@ -15,7 +15,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourname/pi-subagent-durable.git"
+    "url": "https://github.com/roshameow/pi-subagent-durable.git"
   },
   "scripts": {
     "check": "rm -rf /tmp/pi-subagent-durable-check && npx esbuild extensions/index.ts extensions/context-inherit.ts --bundle --platform=node --format=esm --external:@earendil-works/* --external:@rmux/* --external:typebox --outdir=/tmp/pi-subagent-durable-check && node tests/identity.test.mjs && node tests/dispatch.test.mjs && node tests/session-resume.test.mjs && node tests/safety.test.mjs && node tests/self-management-regression.test.mjs && node tests/ownership-registry.test.mjs && node tests/context-inherit.test.mjs"
@@ -34,5 +34,11 @@
     "extensions": [
       "./extensions"
     ]
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }
