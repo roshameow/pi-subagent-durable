@@ -1088,13 +1088,18 @@ async function runSingleAgent(
 				exitCode = await new Promise<number>((resolve) => {
 					const timer = setInterval(async () => {
 						let isDead = false;
+						// Keep the command result in the callback scope: it is needed after
+						// the try/catch when deciding whether a retained dead window exists.
+						// A block-scoped `const panes` here previously caused every completed
+						// synchronous rmux worker to crash the parent with ReferenceError.
+						let panes: any | null = null;
 						try {
-							const panes = await rmux.cmd("list-panes", "-t", rmuxTarget);
+							panes = await rmux.cmd("list-panes", "-t", rmuxTarget);
 							isDead = panes.returnCode !== 0 || (panes.stdout?.includes("(dead)") ?? false);
 						} catch { isDead = true; }
 						if (isDead) {
 							clearInterval(timer);
-							if (panes.returnCode === 0) {
+							if (panes?.returnCode === 0) {
 								try { await rmux.cmd("kill-window", "-t", rmuxTarget.split(".")[0]); } catch {}
 							}
 							// 读 filter 写入的 agent-log,重建 messages(供 {previous} 传递)
