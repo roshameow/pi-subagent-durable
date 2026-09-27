@@ -989,6 +989,7 @@ async function runSingleAgent(
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let tmpTaskDir: string | null = null;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -1019,7 +1020,14 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${workerTaskText(agentName, task)}`);
+		// SECURITY/ROBUSTNESS (2026-09-28): never put the task text into argv. argv is visible
+		// via `ps`, so any `pkill -f` / `pgrep -f <string taken from a task text>` matches the
+		// worker process and SIGTERMs it (real incident: `pkill -f prod_retry.py` killed every
+		// worker whose task text mentioned `.../prod_retry.py`, in the same second).
+		const taskFile = await writePromptToTempFile(`${agent.name}-task`, `Task: ${workerTaskText(agentName, task)}`);
+		tmpTaskDir = taskFile.dir;
+		args.push("--append-system-prompt", taskFile.filePath);
+		args.push("Proceed with the task described in the appended instructions.");
 		let wasAborted = false;
 
 		// 从 JSON 事件流提取消息(rmux 路径读 filter 日志,spawn 路径读 stdout)
@@ -1186,6 +1194,12 @@ async function runSingleAgent(
 		if (tmpPromptDir)
 			try {
 				fs.rmdirSync(tmpPromptDir);
+			} catch {
+				/* ignore */
+			}
+		if (tmpTaskDir)
+			try {
+				fs.rmSync(tmpTaskDir, { recursive: true, force: true });
 			} catch {
 				/* ignore */
 			}
@@ -2601,7 +2615,12 @@ export default function (pi: ExtensionAPI) {
 			fs.writeFileSync(tmpPromptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 			piArgs.push("--append-system-prompt", tmpPromptPath);
 		}
-		piArgs.push(`Task: ${workerTaskText(agentName, taskText)}`);
+		// SECURITY/ROBUSTNESS (2026-09-28): keep the task text out of argv (same reason as the
+		// fallback spawn path above — `pkill -f` / `pgrep -f` must never match a live worker).
+		const tmpTaskPath = path.join(os.tmpdir(), `pi-worker-task-${taskId}.md`);
+		fs.writeFileSync(tmpTaskPath, `Task: ${workerTaskText(agentName, taskText)}`, { encoding: "utf-8", mode: 0o600 });
+		piArgs.push("--append-system-prompt", tmpTaskPath);
+		piArgs.push("Proceed with the task described in the appended instructions.");
 
 		// 输出日志文件（给 /agent-live 看）
 		const logPath = path.join(getAgentLogDir(), `${taskId}.jsonl`);
