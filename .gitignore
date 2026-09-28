@@ -11,4 +11,6 @@ dist/
 
 # pi install artifacts
 .npm/
-docs/
+/docs/*
+!/docs/reference.md
+!/docs/walkthrough.md
