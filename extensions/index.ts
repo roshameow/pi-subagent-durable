@@ -37,7 +37,8 @@ import {
 	registerWorkerOwnership,
 	unregisterWorkerOwnership,
 	readWorkerOwnershipRegistry,
-} from "./ownership-registry.mjs";
+	refreshWorkerOwnership,
+} from "./ownership-registry-v2.mjs";
 import {
 	assertBatchWithinLimit,
 	assertSubagentSpawnAllowed,
@@ -51,7 +52,7 @@ import {
 import { resolveDispatchConfig } from "./dispatch.mjs";
 import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
 import { RecoveryController, probeRmuxTask, readTaskRecords } from "./recovery.mjs";
-import { prepareUpgrade, publishUpgradeManifest } from "./upgrade-handoff.mjs";
+import { prepareUpgrade, publishUpgradeManifest } from "./upgrade-handoff-v2.mjs";
 import { selectListedTasks } from "./list-scope.mjs";
 import { startReceiverKeeper } from "./receiver-keeper.mjs";
 
@@ -260,6 +261,16 @@ function registerWorker(taskId: string, cwd: string, taskText?: string): void {
 		externalActiveTaskIds: discoverLiveTaskIdsFast(),
 	});
 	ownerships.set(taskId, ownerToken);
+}
+
+function restoreWorkerRegistration(taskId: string): void {
+	const ownerToken = workerOwnerships().get(taskId);
+	if (!ownerToken) {
+		console.warn(`[subagent] reload kept ${taskId} unchanged: no in-memory ownership token; inspect before preparing a handoff`);
+		return;
+	}
+	const restored = refreshWorkerOwnership(getWorkerRegistryPath(), taskId, process.pid, ownerToken, { isSettled: workerLogIsSettled });
+	if (!restored) console.warn(`[subagent] reload kept ${taskId} unchanged: ownership reservation is missing; explicit recovery is required`);
 }
 
 function unregisterWorker(taskId: string): void {
@@ -3570,11 +3581,17 @@ export default function (pi: ExtensionAPI) {
 			if (originId !== currentSessionId) { console.warn(`[subagent] completion belongs to ${originId}; delivery to current ${currentSessionId} refused; saved log/ledger retained`); return; }
 			pi.sendUserMessage(body, { deliverAs: "steer" });
 		};
-		// reload 后 asyncTasks 保存在 globalThis，重新把仍存活的任务注册给
-		// watcher 路由；否则新模块会把它们误判成 stale target。
+		// Same-process reload preserves the authenticated reservation and its
+		// original domain keys. Resume/steering text may mention other items;
+		// parsing it again here can falsely collide with a different live owner.
 		for (const [id, entry] of asyncTasks) {
 			if (entry.recoveryManaged || entry.parentSessionId !== currentSessionId) continue;
-			registerWorker(id, entry.cwd || (ctx as any).cwd || process.cwd(), entry.task);
+			try { restoreWorkerRegistration(id); }
+			catch (error: any) {
+				// A single conflicted task must not prevent this parent's runtime
+				// registration and make the external bootstrap impossible.
+				console.warn(`[subagent] reload ownership refresh refused for ${id}: ${error.message}; reservation unchanged`);
+			}
 		}
 		// reload 安全:把会话状态存到 globalThis,新模块加载时恢复
 		const g = globalThis as any;

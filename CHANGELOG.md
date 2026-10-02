@@ -26,6 +26,15 @@
 
 ### Fixed / 修复
 
+- **Authenticated reload refresh:** preserve an existing worker's original domain keys, token, PID and cwd instead of re-deriving item ownership from a resume/steering prompt. An incidental number in batch context can no longer rebind a worker to a different occupied item. Restore refuses wrong credentials or missing reservations; one refusal does not abort parent runtime registration.
+  **经验证的 reload 刷新：** 保留已有 worker 原 domain keys、token、PID 和 cwd，不从恢复/追加指令重新派生事项所有权。批次上下文中的其他数字不再把 worker 重绑到另一已占用事项。错误凭据或缺失 reservation 仍拒绝恢复；单个拒绝不再中断主 runtime 登记。
+
+- **Native ESM cache compatibility:** versioned registry/handoff implementations are imported directly by new runtime code and the external bootstrap. Canonical entry points remain compatibility re-exports for fresh consumers. This avoids old `.mjs` namespaces lacking new functions after Pi factory reload; rewriting a loaded canonical file alone cannot update its Node namespace.
+  **原生 ESM 缓存兼容：** 新 runtime 和外部 bootstrap 直接导入带版本的 registry/handoff 实现；原入口为新消费者保留兼容 re-export。避免 Pi factory reload 后旧 `.mjs` namespace 缺少新增函数；只改写已加载原文件无法更新 Node namespace。
+
+- **Failed-reload bootstrap:** explicit `--parent-pid` permits recovery when a failed startup removed the runtime slot, but only with independently verified PID and a fresh exact main-notify identity matching PID/session/cwd. Conflicting or multiple runtime slots remain refused; no cwd guessing or ownership override.
+  **失败 reload 的 bootstrap 补救：** runtime 槽因启动失败而缺失时，可显式使用 `--parent-pid`，但必须独立核验 PID，且新鲜精确的 main-notify 身份须匹配 PID/session/cwd。冲突或多个 runtime 仍拒绝；不按 cwd 猜测，不覆盖 ownership。
+
 - **Session-isolated `subagent_list`:** default listing is limited to the calling main session's exact task tree, including known descendants and cold-recovered tasks. Same-cwd/process workers, foreign sessions and unknown lineage no longer leak into the default list. Read the current caller session on every invocation; explicit parent-task links prevent a reused worker session ID from bridging unrelated task trees. `scope: "machine"` is an explicit main-only opt-in; worker self/ancestor/sibling restrictions remain unchanged.
   **`subagent_list` 主会话隔离：** 默认仅显示调用它的主会话所属任务树，包括已知后代及冷恢复任务；相同 cwd/进程、其他会话和来源不明的 worker 不再混入默认列表。每次调用读取当前主 session；优先使用明确 parent task，防止复用 worker session ID 时串入其他任务树。主代理可显式设置 `scope: "machine"` 查看机器级任务，worker 的自身/祖先/兄弟管理限制不变。
 
@@ -39,6 +48,9 @@
   **保守处理恢复失败：** RMUX 查询错误保持 `unknown`，不误报完成；不强行重建缺失 ownership、不覆盖活跃的其他 token；准备失败不会发布 ready 授权，已完成但未跟踪的历史不会作为新任务重放。不同主会话须逐一交接。
 
 ### Tests / 测试
+
+- Added a real JITI/native ESM warm-cache reproduction and versioned dependency recovery, reservation-refresh credential/key preservation checks, a real extension-host reload collision fixture, and explicit-PID bootstrap validation/refusal tests using disposable state.
+  新增真实 JITI/原生 ESM 热缓存复现及版本化依赖恢复、reservation 刷新凭据/key 保留检查、真实扩展 host 的 reload 事项碰撞 fixture，以及使用临时状态的显式 PID bootstrap 验证/拒绝测试。
 
 - Added pure lineage tests and real extension-host list calls for same-cwd foreign workers, `/new`/caller-session switches, unknown ownership, descendants of settled parents, reused worker session IDs, explicit machine scope and worker scope refusal.
   新增纯任务关系测试和真实扩展 host 列表调用测试，覆盖同 cwd 的其他会话 worker、`/new`/调用 session 切换、未知归属、已结束父任务的后代、复用 worker session ID、显式机器级查看及 worker scope 拒绝。

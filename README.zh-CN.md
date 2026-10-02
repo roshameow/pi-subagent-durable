@@ -103,6 +103,21 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
 
 如果仍有意 reload 旧主代理以加载这些命令，现有内存中的 legacy 回调会保留：恢复仅续期它们的 controller 权限，**不会**增加第二套完成监控。只有缺失的外部任务或已由 recovery 管理的任务才会重建监控。Reload 不会降级 receiver ownership。Legacy 完成 steering 保守绑定到原主会话；执行 `/new` 后，结果延后保存在原日志/账本中，而不注入新会话。来源不明确的 legacy 投递会被拒绝。首次迁移仍建议 bootstrap，因为它无需 reload 旧回调代码。
 
+### Reload 错误处理
+
+Reload 必须保留已有 worker 经验证的 item keys/token。恢复或追加指令可能提到其他事项，不是新的所有权声明；当前实现只刷新原 reservation，不再解析那段提示词重绑事项。单个刷新失败会逐任务报告，不再中断主代理 runtime 登记；不会静默重建缺失或身份不匹配的所有权。
+
+Pi 的 `/reload` 会清理扩展 factory，但 Node 可能保留原生 `.mjs` namespace。新 runtime 使用带版本的 registry/handoff 入口，避开旧 namespace 缺少新增 export 的错误。兼容 shim 无法刷新进程里已加载的 namespace；未来 ABI 变化仍需新模块版本或新进程。计划升级优先使用外部 bootstrap。
+
+如果此前失败的 reload 已删除主 runtime 槽、尚未写入替代槽，bootstrap 默认拒绝。操作者独立核验进程后，可显式提供 `--parent-pid VERIFIED_LIVE_MAIN_PID`。此补救仍强制校验**精确、新鲜的 main-notify 注册**，PID/canonical 会话/cwd 必须匹配；存在冲突或多个 runtime 时仍拒绝，不按 cwd 猜 PID，也不绕过 worker ownership：
+
+```bash
+node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
+  --session '/absolute/canonical-parent.jsonl' --parent-pid VERIFIED_LIVE_MAIN_PID
+```
+
+不要为绕过准备失败而清空注册表、停止现有事项 owner，或提前退出主代理。必须先确认交接成功。
+
 ### 持久化与投递边界
 
 - `<agent-dir>/agent-upgrades/<parentSessionId>.json` 是版本 launcher 必须验证的 ready manifest；仅提供会话路径不等于完成交接。

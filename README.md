@@ -103,6 +103,21 @@ Keep the original parent idle with no pending conversation work and stop dispatc
 
 If you deliberately reload an older parent to load these commands, existing in-memory legacy callbacks are retained: recovery renews their controller authority but does **not** install a second completion monitor. Only missing external tasks or already recovery-managed tasks get rebuilt monitors. Receiver ownership is not downgraded during reload. Legacy completion steering is bound conservatively to its original parent; after `/new`, it is deferred to the original saved log/ledger rather than injected into the new session. Ambiguous legacy origins are refused. The bootstrap remains preferable because it needs no reload of old callback code.
 
+### Reload troubleshooting
+
+Reload must preserve an existing worker's authenticated item keys/token; a resume or steering prompt can mention a different item and is not a new ownership declaration. This implementation refreshes the original reservation instead of parsing that prompt again. A failed refresh is reported per task and does not abort the parent's runtime registration; missing or mismatched authority is never silently recreated.
+
+Pi clears extension factories on `/reload`, but Node can retain native `.mjs` namespaces. New runtime code uses versioned registry/handoff entry points to avoid old namespaces missing newly added exports. Compatibility shims cannot refresh a namespace already loaded in a process; future ABI changes need a new module version or a fresh process. Prefer the external bootstrap for planned upgrades.
+
+If an earlier failed reload removed the parent's runtime slot before writing its replacement, the bootstrap normally refuses. An operator may supply `--parent-pid VERIFIED_LIVE_MAIN_PID` after independently checking that process. This fallback still requires the **exact, fresh main-notify registration**, matching PID/canonical session/cwd, and refuses conflicting or multiple runtime slots; it does not guess a PID from cwd or bypass worker ownership:
+
+```bash
+node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
+  --session '/absolute/canonical-parent.jsonl' --parent-pid VERIFIED_LIVE_MAIN_PID
+```
+
+Do not clear the registry, stop the existing item owner, or exit the parent to bypass a preparation refusal. Require a successful handoff first.
+
 ### Persistence and delivery boundaries
 
 - `<agent-dir>/agent-upgrades/<parentSessionId>.json` is the ready manifest required by the versioned launcher; a session path alone is not a handoff.

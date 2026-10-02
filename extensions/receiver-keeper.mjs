@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { heartbeatWorkerOwnerships, readWorkerOwnershipRegistry } from "./ownership-registry.mjs";
+import { heartbeatWorkerOwnerships, readWorkerOwnershipRegistry } from "./ownership-registry-v2.mjs";
 import { atomicRecoveryWrite } from "./recovery.mjs";
 
 const alive = pid => { try { process.kill(pid, 0); return Number.isInteger(pid) && pid >= 2; } catch { return false; } };
