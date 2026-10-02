@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 
 const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 const STALE_LOCK_MS = 30000;
+const RECEIVER_HEARTBEAT_MAX_AGE_MS = 90000;
+const RECEIVER_HEARTBEAT_FUTURE_TOLERANCE_MS = 5000;
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -89,9 +91,51 @@ function normalizeKeys(record) {
   return [...new Set([...keys, ...legacy])];
 }
 
+// Receiver identity, not a parent's registry heartbeat, proves ownership. Fail
+// closed on missing/partial files, PID reuse with a different task, and bad clocks.
+export function validateReceiverIdentity(record, options = {}) {
+  try {
+    if (typeof record?.taskId !== "string" || !record.taskId) throw new Error("missing task ID");
+    if (typeof record.cwd !== "string" || !record.cwd || typeof record.receiverIdentityPath !== "string" || !record.receiverIdentityPath) throw new Error("missing cwd or identity path");
+    const identity = JSON.parse(fs.readFileSync(record.receiverIdentityPath, "utf8"));
+    const workerPid = record.workerPid ?? identity?.pid;
+    if (!Number.isInteger(workerPid) || workerPid < 2 || identity?.version !== 2 || identity.taskId !== record.taskId || identity.pid !== workerPid) throw new Error("task, version or PID mismatch");
+    if (typeof identity.cwd !== "string" || !identity.cwd || path.resolve(identity.cwd) !== path.resolve(record.cwd)) throw new Error("cwd mismatch");
+    const heartbeat = typeof identity.heartbeatAt === "string" ? Date.parse(identity.heartbeatAt) : NaN;
+    const age = (options.now ?? Date.now()) - heartbeat;
+    if (!Number.isFinite(heartbeat) || !Number.isFinite(age) || age > RECEIVER_HEARTBEAT_MAX_AGE_MS || age < -RECEIVER_HEARTBEAT_FUTURE_TOLERANCE_MS) throw new Error("heartbeat expired or invalid");
+    if (!pidAlive(workerPid)) throw new Error("receiver PID is not alive");
+    return identity;
+  } catch (error) {
+    throw new Error(`invalid or stale receiver identity for ${record?.taskId}: ${error.message}`, { cause: error });
+  }
+}
+
+function readLiveReceiverIdentity(record, taskId, now) {
+  if (record?.taskId !== taskId || !Number.isInteger(record.workerPid)) return null;
+  try { return validateReceiverIdentity(record, { now }); } catch { return null; }
+}
+
+function receiverOwnershipRecord(record) {
+  if (!Number.isInteger(record.workerPid)) throw new Error(`invalid receiver worker PID for ${record.taskId}`);
+  const identity = validateReceiverIdentity(record);
+  return {
+    ...record,
+    version: 2,
+    ownershipMode: "receiver",
+    ownerPid: record.workerPid,
+    pid: record.workerPid,
+    heartbeatAt: identity.heartbeatAt,
+  };
+}
+
 function pruneWorkers(data, isSettled) {
   const now = Date.now();
   for (const [taskId, record] of Object.entries(data.workers)) {
+    if (record?.ownershipMode === "receiver") {
+      if (isSettled?.(taskId) || !readLiveReceiverIdentity(record, taskId, now)) delete data.workers[taskId];
+      continue;
+    }
     const pid = Number(record?.ownerPid ?? record?.pid);
     const heartbeat = Date.parse(String(record?.heartbeatAt || record?.startedAt || ""));
     const heartbeatExpired = Number.isFinite(heartbeat) && now - heartbeat > 120000;
@@ -118,9 +162,13 @@ export function registerWorkerOwnership(registryPath, record, options = {}) {
   const itemKeys = normalizeKeys(record);
   return withRegistryLock(registryPath, (data) => {
     const current = data.workers[record.taskId];
-    if (current && current.ownerToken && current.ownerToken !== record.ownerToken && pidAlive(Number(current.ownerPid ?? current.pid))) {
+    if (current && current.ownerToken && current.ownerToken !== record.ownerToken) {
       throw new Error(`worker ownership token mismatch for ${record.taskId}`);
     }
+    // A parent from an older extension generation must not downgrade a receiver
+    // reservation or replace its keys, PID, or identity path during /reload.
+    if (current?.ownershipMode === "receiver" && record.ownershipMode !== "receiver") return current;
+    const receiver = record.ownershipMode === "receiver" ? receiverOwnershipRecord(record) : null;
     const otherWorkers = Object.entries(data.workers).filter(([taskId]) => taskId !== record.taskId);
     const activeTaskIds = new Set(otherWorkers.map(([taskId]) => taskId));
     for (const taskId of options.externalActiveTaskIds || []) {
@@ -144,14 +192,46 @@ export function registerWorkerOwnership(registryPath, record, options = {}) {
     }
     data.workers[record.taskId] = {
       ...record,
-      version: 2,
-      ownerPid: Number(record.ownerPid ?? record.pid ?? process.pid),
-      pid: Number(record.ownerPid ?? record.pid ?? process.pid),
+      ...(receiver || {
+        version: 2,
+        ownerPid: Number(record.ownerPid ?? record.pid ?? process.pid),
+        pid: Number(record.ownerPid ?? record.pid ?? process.pid),
+        heartbeatAt: new Date().toISOString(),
+      }),
       ownerToken: String(record.ownerToken),
       itemKeys,
       itemIds: itemKeys.filter((key) => /^\d{6}$/.test(key)),
-      heartbeatAt: new Date().toISOString(),
     };
+  }, options);
+}
+
+// Upgrade an existing reservation in the same transaction that authenticates
+// its token and the receiver. This cannot recreate a missing/pruned reservation
+// or use the transition to change the reserved keys or lease token.
+export function migrateWorkerOwnershipToReceiver(registryPath, taskId, ownerToken, receiver, options = {}) {
+  return withRegistryLock(registryPath, (data) => {
+    const current = data.workers[taskId];
+    if (!current) throw new Error(`worker ownership missing for ${taskId}`);
+    if (!ownerToken || !current.ownerToken || current.ownerToken !== ownerToken) {
+      throw new Error(`worker ownership token mismatch for ${taskId}`);
+    }
+    if (current.workerPid != null && current.workerPid !== receiver.workerPid) {
+      throw new Error(`worker ownership PID mismatch for ${taskId}`);
+    }
+    if (current.parentSessionId && receiver.parentSessionId && current.parentSessionId !== receiver.parentSessionId) throw new Error(`worker ownership parent mismatch for ${taskId}`);
+    const itemKeys = normalizeKeys(current);
+    const migrated = receiverOwnershipRecord({
+      ...current,
+      ownershipMode: "receiver",
+      workerPid: receiver.workerPid,
+      receiverIdentityPath: receiver.receiverIdentityPath,
+      parentSessionId: receiver.parentSessionId ?? current.parentSessionId,
+      ownerToken: current.ownerToken,
+      itemKeys,
+      itemIds: itemKeys.filter((key) => /^\d{6}$/.test(key)),
+    });
+    data.workers[taskId] = migrated;
+    return migrated;
   }, options);
 }
 
@@ -169,7 +249,14 @@ export function heartbeatWorkerOwnerships(registryPath, ownerships, options = {}
     const now = new Date().toISOString();
     for (const [taskId, ownerToken] of ownerships) {
       const current = data.workers[taskId];
-      if (current?.ownerToken === ownerToken) current.heartbeatAt = now;
+      if (!current || current.ownerToken !== ownerToken) continue;
+      if (current.ownershipMode === "receiver") {
+        const identity = readLiveReceiverIdentity(current, taskId, Date.now());
+        if (identity) current.heartbeatAt = identity.heartbeatAt;
+        else delete data.workers[taskId];
+      } else {
+        current.heartbeatAt = now;
+      }
     }
   }, options);
 }

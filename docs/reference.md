@@ -42,7 +42,7 @@ pi -e ./pi-subagent-durable
 | Tool | What it does |
 |------|--------------|
 | `subagent` | Delegate tasks (single / parallel / chain). Runs async in the background with a persistent pane. |
-| `subagent_list` | List running subagents: taskId / agent / sessionId / context usage / task summary. |
+| `subagent_list` | List this main session's task tree by default: taskId / agent / sessionId / context usage / task summary. Main-only `scope: "machine"` explicitly lists across sessions; worker callers remain descendant-only. |
 | `subagent_reload` | **Kill + reconnect** a running subagent from its saved conversation history (resumed from its saved session, picks up freshly loaded tools/extensions/MCP). Also resumes paused/finished sessions directly. Match by `taskId` / `agent` / `sessionId`; none given = all. |
 | `subagent_stop` | Kill a task and its descendants without resuming; no selector triggers the fast machine-wide emergency stop. |
 | `subagent_gc` | Remove completed/dead rmux panes only; live workers are never touched. |
@@ -90,6 +90,8 @@ Changes to agent definitions are picked up on the next call (no reload needed). 
 /agent-live                    # TUI view of running agents (or Alt+A)
 /agent-results                 # recent results
 /agent:resume <session-id> [continue instructions]
+/agent:prepare-upgrade        # verified async RMUX handoff; no worker restart
+/agent:recover                # same-parent controller reconcile and offline results
 /agent:stop-all                # immediate machine-wide emergency stop
 /agent:gc                      # remove dead rmux panes only
 ```
@@ -102,7 +104,7 @@ Safe defaults prevent a worker-decomposition loop from becoming a process storm:
 - **At most 15 active durable workers machine-wide.** Admission is serialized through the worker-registry lock, so concurrent Pi sessions cannot race past the limit.
 - **Parallel requests are capped at 15 entries and chains at 8 before either sync or async dispatch.** Omitted `async` means `false`.
 - **Recursive stop is the default for main-session management.** `subagent_stop { taskId: ... }` includes descendants. Main sessions may use selector-free `subagent_stop` or `/agent:stop-all` for a machine-wide emergency stop. Worker callers may manage descendants only; self/ancestor/sibling targets and selector-free stop/reload are refused.
-- Only rmux panes with `pane_dead=0` count as running. Completed panes are removed automatically; `/agent:gc` cleans historical dead panes without touching live workers.
+- Only rmux panes with `pane_dead=0` count as running. Legacy monitors remove completed panes automatically; fenced recovery leaves retained dead panes for `/agent:gc`, which never touches live workers.
 - Every task immediately records parent task/session/path/depth, and new child session headers receive standard `parentSession` lineage for `/resume` and session viewers.
 - Discovery reads only bounded log prefixes, so emergency management does not load multi-gigabyte task logs into memory.
 
@@ -114,6 +116,10 @@ PI_SUBAGENT_MAX_ACTIVE=20  # machine-wide cap; default 15, hard-clamped to 64
 ```
 
 Raising these limits weakens the safety boundary. Prefer explicit main-session orchestration.
+
+### Parent upgrade handoff
+
+See the [README upgrade workflow](../README.md#upgrade-the-parent-without-restarting-rmux-workers) for prerequisites, first migration from older code, canonical restart, the bounded legacy receiver keeper, and at-least-once result delivery. Preparation writes a private task ledger under `durable-tasks/` and a ready manifest under `agent-upgrades/<parentSessionId>.json`. Receiver ownership preserves worker identity; controller leases are separate, exact-parent-bound and generation-fenced. Failed preparation does not authorize an upgrade. `session_start` and `/agent:recover` claim only this parent's persisted RMUX tasks; RMUX query errors remain unknown.
 
 ### What persists
 

@@ -36,6 +36,7 @@ import {
 	heartbeatWorkerOwnerships,
 	registerWorkerOwnership,
 	unregisterWorkerOwnership,
+	readWorkerOwnershipRegistry,
 } from "./ownership-registry.mjs";
 import {
 	assertBatchWithinLimit,
@@ -49,6 +50,10 @@ import {
 } from "./safety.mjs";
 import { resolveDispatchConfig } from "./dispatch.mjs";
 import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
+import { RecoveryController, probeRmuxTask, readTaskRecords } from "./recovery.mjs";
+import { prepareUpgrade, publishUpgradeManifest } from "./upgrade-handoff.mjs";
+import { selectListedTasks } from "./list-scope.mjs";
+import { startReceiverKeeper } from "./receiver-keeper.mjs";
 
 // ── RMUX integration ──
 const RMUX_SESSION_NAME = "pi-agents";
@@ -232,6 +237,9 @@ function resolveWorkerItemKeys(taskId: string, taskText?: string): string[] {
 }
 
 function registerWorker(taskId: string, cwd: string, taskText?: string): void {
+	// Receiver-owned reservations must never be rewritten as parent-owned on /reload.
+	const existing = readWorkerOwnershipRegistry(getWorkerRegistryPath()).workers[taskId];
+	if (existing?.ownershipMode === "receiver") return;
 	const ownerships = workerOwnerships();
 	if (workerLogIsSettled(taskId)) {
 		unregisterWorker(taskId);
@@ -325,7 +333,8 @@ function fallbackWorkerAgent(cwd?: string): AgentConfig {
 
 function makeRmuxWindowName(agentName: string, taskId: string): string {
 	const safe = agentName.replace(/[^a-zA-Z0-9_-]/g, "_");
-	return `${safe}-${taskId}`.slice(0, 60);
+	const suffix = `-${taskId}`;
+	return `${safe.slice(0, Math.max(0, 60 - suffix.length))}${suffix}`;
 }
 
 // 从 NDJSON 事件流提取最后一条「非空」的 assistant 文本消息。
@@ -941,6 +950,7 @@ async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
 	assertSubagentSpawnAllowed();
+	assertNotUpgradePrepared();
 	let agent = agents.find((a) => a.name === agentName);
 	// _worker: 通用 worker，不依赖预注册 agent（与 runAsyncSingleAgent 保持一致）
 	if (!agent && agentName === "_worker") {
@@ -978,6 +988,7 @@ async function runSingleAgent(
 	} catch {}
 	appendTaskMetadata(logPath, taskId, agentName, task, cwd ?? defaultCwd);
 	appendTaskLineage(logPath);
+	fs.appendFileSync(logPath, JSON.stringify({ type: "pi_subagent_launch", mode: "sync" }) + "\n");
 
 	const args: string[] = ["--mode", "json", "-p"];
 	const dispatch = resolveDispatchConfig(agent.model, dispatchDefaults);
@@ -1283,6 +1294,7 @@ interface AsyncTaskEntry {
 	sessionId?: string;      // 子 agent 自己的 pi 会话 id（重连 --session 用）
 	parentSessionId?: string; // 派生它的父 pi 会话 id（任务树/当前会话过滤用）
 	parentTaskId?: string;    // 若父本身是 worker，记录其 task id
+	recoveryManaged?: boolean; // fenced recovery controller owns completion monitoring
 	intentionalKill?: boolean; // 主 agent 主动 kill（reload/stop），完成回调不再发通知
 	usage?: TaskUsage;       // token/成本/上下文统计（从 agent-logs 增量聚合）
 	statsOffset?: number;    // agent-logs 已解析字节偏移
@@ -1296,12 +1308,21 @@ function getAsyncTasks(): Map<string, AsyncTaskEntry> {
 	return g[GLOBAL_TASKS_KEY] as Map<string, AsyncTaskEntry>;
 }
 const asyncTasks = getAsyncTasks();
+let upgradeController: RecoveryController | null = null;
+function recoveryManagedTaskIds(): Set<string> {
+	const g = globalThis as any;
+	return g.__pi_subagent_recovery_managed__ ||= new Set<string>();
+}
+function assertNotUpgradePrepared() {
+	if ((globalThis as any).__pi_subagent_upgrade_prepared__ === currentSessionId && currentSessionId)
+		throw new Error("Upgrade handoff prepared: restart the parent before dispatching more tasks.");
+}
 const GLOBAL_COMPLETION_SENDER_KEY = "__pi_subagent_completion_sender__";
 
-function sendCompletionToCurrentSession(fallbackPi: any, body: string): void {
+function sendCompletionToCurrentSession(fallbackPi: any, body: string, parentSessionId?: string): void {
 	const sender = (globalThis as any)[GLOBAL_COMPLETION_SENDER_KEY];
-	if (typeof sender === "function") sender(body);
-	else fallbackPi.sendUserMessage(body, { deliverAs: "steer" });
+	if (typeof sender === "function") sender(body, parentSessionId);
+	else if (!parentSessionId || parentSessionId === currentSessionId) fallbackPi.sendUserMessage(body, { deliverAs: "steer" });
 }
 
 // 诊断:记录扩展加载 + rmux 可用性(帮助排查"新 pi 看不到 subagent")
@@ -1379,6 +1400,9 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
 	}
 	const entry = knownEntry || asyncTasks.get(taskId) || discoverExternalTasks(true).get(taskId);
 	if (!entry) return false;
+	const durable = readTaskRecords(path.join(getAgentDir(), "durable-tasks"), entry.parentSessionId).find((r: any) => r.taskId === taskId);
+	if (durable && (durable.parentSessionId !== currentSessionId || !upgradeController)) return false;
+	if (durable) { try { upgradeController!.fence(taskId); } catch { return false; } }
 	entry.intentionalKill = true;
 	try {
 		if (entry.useRmux && entry.rmuxTarget) {
@@ -1387,7 +1411,9 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
 			try {
 				const rmux = await getRmux();
 				if (rmux) {
-					await rmux.cmd("kill-window", "-t", windowTarget);
+					const killed = await rmux.cmd("kill-window", "-t", windowTarget);
+					if (killed.returnCode !== 0) throw new Error("RMUX kill-window failed");
+					upgradeController?.stopTask(taskId);
 					diagLog(`kill ok (sdk) ${taskId} -> ${windowTarget}`);
 					return true;
 				}
@@ -1399,6 +1425,7 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
 			// 2) 兜底：直接走 rmux CLI（绕过 stale 的 SDK 客户端）
 			try {
 				execFileSync("rmux", ["kill-window", "-t", windowTarget], { stdio: "ignore", timeout: 8000 });
+				upgradeController?.stopTask(taskId);
 				diagLog(`kill ok (cli) ${taskId} -> ${windowTarget}`);
 				return true;
 			} catch (e) {
@@ -1553,7 +1580,7 @@ function discoverExternalTasks(force = false): Map<string, AsyncTaskEntry> {
 		// 结束检测:最后一行是终态事件则跳过
 		let lastType = "";
 		try { lastType = (JSON.parse(lines[lines.length - 1]).type || "") as string; } catch {}
-		if (lastType === "agent_end" || lastType === "agent_settled") continue;
+		// A terminal model turn does not establish process death (notification waits may remain live).
 		let agent = "unknown";
 		let task = "";
 		let cwd = "";
@@ -1613,7 +1640,7 @@ function renderSubagentWidget(u: any) {
 	// 只显示与当前会话相关的任务:本进程 spawn 的(内存) + 其他进程里
 	// 父会话 id == 当前会话的外部任务。原来把全进程任务列表合并进来,
 	// 导致每个 pi 会话的 terminal 都显示同样的 widget,而不是只在父会话。
-	const all = new Map(asyncTasks);
+	const all = new Map([...asyncTasks].filter(([, e]) => e.parentSessionId === currentSessionId));
 	for (const [id, e] of discoverExternalTasks()) {
 		if (!all.has(id) && e.parentSessionId === currentSessionId) all.set(id, e);
 	}
@@ -1888,6 +1915,12 @@ function fmtUsageShort(u?: TaskUsage): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Pre-upgrade callbacks cannot be rewritten. Remember their parent binding
+	// before cleanup removes their Map entry; body-only legacy calls are routed
+	// conservatively and are never steered into an unrelated /new session.
+	const g = globalThis as any;
+	const legacyCallbacks: Map<string, AsyncTaskEntry> = g.__pi_subagent_legacy_callbacks__ ||= new Map();
+	for (const [id, entry] of asyncTasks) if (!entry.recoveryManaged) legacyCallbacks.set(id, entry);
 	// pi.appendEntry 签名是 (customType: string, data?: T)。之前传单个对象当
 	// customType,生成畸形条目(customType=对象、data=undefined),TUI 渲染
 	// entry_appended 时抛错 → "appendEntry failed"。改传 ("agent", {key,value})
@@ -1905,6 +1938,106 @@ export default function (pi: ExtensionAPI) {
 			diagLog(`appendEntry retry ERR ${String(e instanceof Error ? e.message : e).slice(0, 200)}`);
 		}
 	};
+
+
+	const ledgerDir = () => path.join(getAgentDir(), "durable-tasks");
+	const notifyDir = () => path.dirname(getWorkerRegistryPath());
+	const controllerRegistryPath = () => path.join(ledgerDir(), ".controllers.json");
+	const createUpgradeController = (ctx: any) => {
+		const parentId = ctx.sessionManager.getSessionId();
+		const rawParentPath = ctx.sessionManager.getSessionFile();
+		const parentPath = fs.existsSync(rawParentPath) ? fs.realpathSync(rawParentPath) : rawParentPath;
+		const entries = () => ctx.sessionManager.getEntries();
+		const queued = new Map<string, number>();
+		const acknowledged = (id: string) => entries().some((e: any) => {
+			if (e.type === "custom" && e.customType === "agent-delivery" && e.data?.resultId === id) return true;
+			if (e.type !== "message" || e.message?.role !== "user") return false;
+			const content = e.message.content;
+			const text = typeof content === "string" ? content : (content || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
+			return text.startsWith(`[subagent resultId=${id}]`);
+		});
+		return new RecoveryController({ ledgerDir: ledgerDir(), controllerRegistryPath: controllerRegistryPath(),
+			parentSessionId: parentId, parentSessionPath: parentPath,
+			probe: async (record: any) => { const rmux = await getRmux(); return rmux ? probeRmuxTask((...args: string[]) => rmux.cmd(...args), record) : { state: "unknown", reason: "RMUX unavailable" }; },
+			isAcknowledged: acknowledged,
+			skipExistingCallback: (record: any) => { const entry = asyncTasks.get(record.taskId); return Boolean(entry && !entry.recoveryManaged); },
+			deliver: async (record: any, fence: () => void, guard: (operation: () => void) => void) => {
+				if (currentSessionId !== parentId || currentSessionFile !== parentPath) throw new Error("parent session changed; delivery deferred");
+				fence();
+				const result = record.result;
+				const queuedAt = queued.get(result.resultId);
+				if (queuedAt !== undefined && (!ctx.isIdle() || Date.now() - queuedAt < 30000)) return false;
+				if (!entries().some((e: any) => e.type === "custom" && e.customType === "agent" && e.data?.value?.resultId === result.resultId))
+					guard(() => pi.appendEntry("agent", { key: `agent:${record.agent}:${record.taskId}`, value: { ...result, agent: record.agent, task: record.task } }));
+				fence();
+				guard(() => pi.sendUserMessage(`[subagent resultId=${result.resultId}] Agent "${record.agent}" (${record.taskId}) ${result.interrupted ? "任务中断" : "已完成"}:\n${(result.output || result.summary).slice(0, 4000)}`, { deliverAs: "steer" }));
+				queued.set(result.resultId, Date.now());
+				return false; // next tick confirms the actual user message was persisted
+			},
+			acknowledge: (record: any, fence: () => void, guard: (operation: () => void) => void) => {
+				fence();
+				guard(() => pi.appendEntry("agent-delivery", { resultId: record.result.resultId, taskId: record.taskId, parentSessionId: parentId }));
+			},
+			onLive: (record: any) => {
+				recoveryManagedTaskIds().add(record.taskId);
+				if (record.ownershipToken) workerOwnerships().set(record.taskId, record.ownershipToken);
+				const old = asyncTasks.get(record.taskId);
+				if (!old) asyncTasks.set(record.taskId, { agent: record.agent, task: record.task, cwd: record.cwd,
+					parentSessionId: parentId, sessionId: record.sessionId, parentTaskId: record.parentTaskId,
+					startTime: record.startTime || Date.now(), useRmux: true, rmuxTarget: record.rmuxTarget,
+					proc: { killed: false, exitCode: null }, recoveryManaged: true });
+				else old.recoveryManaged = true;
+				const entry = asyncTasks.get(record.taskId)!; accumulateTaskUsage(record.taskId, entry);
+				renderSubagentWidget(ctx.ui);
+			},
+			onCompleted: async (record: any, fence: () => void, guard: (operation: () => void) => void) => {
+				fence();
+				if (record.ownershipToken) guard(() => unregisterWorkerOwnership(getWorkerRegistryPath(), record.taskId, record.ownershipToken));
+				workerOwnerships().delete(record.taskId); asyncTasks.delete(record.taskId);
+				renderSubagentWidget(ctx.ui);
+			},
+			onError: (error: any) => console.warn("[subagent] recovery:", error.message),
+		});
+	};
+	pi.registerCommand("agent:recover", { description: "Reconcile durable RMUX tasks for this exact parent session (no worker restart)",
+		handler: async (_args, ctx) => {
+			if (CURRENT_WORKER_TASK_ID || !upgradeController) { ctx.ui.notify("Recovery is available only in a persistent main session.", "error"); return; }
+			try { const report = await upgradeController.recover(); ctx.ui.notify(report.join("\n") || "No pending durable tasks for this parent session.", "info"); }
+			catch (e: any) { ctx.ui.notify(`Recovery failed: ${e.message}`, "error"); }
+		} });
+	pi.registerCommand("agent:prepare-upgrade", { description: "Persist RMUX handoff and receiver ownership, then print canonical restart command; never kill workers",
+		handler: async (_args, ctx) => {
+			if (CURRENT_WORKER_TASK_ID || !upgradeController) { ctx.ui.notify("Prepare requires a persistent main session.", "error"); return; }
+			if (!ctx.isIdle()) { ctx.ui.notify("Prepare refused: main session is busy (sync/chain work must finish first).", "error"); return; }
+			const unsafe = [...asyncTasks].filter(([, e]) => e.parentSessionId === currentSessionId && !e.useRmux);
+			if (unsafe.length) { ctx.ui.notify(`Prepare refused: live spawn tasks ${unsafe.map(([id]) => id).join(", ")}`, "error"); return; }
+			try {
+				const rmux = await getRmux(); if (!rmux) throw new Error("RMUX is unavailable");
+				const output = await prepareUpgrade({ ledgerDir: ledgerDir(), registryPath: getWorkerRegistryPath(),
+					parentSessionId: currentSessionId, parentSessionPath: currentSessionFile, cwd: ctx.cwd,
+					logDir: getAgentLogDir(), sessionsRoot: path.join(getAgentDir(), "sessions"), notifyDir: notifyDir(), expectedOwnerPid: process.pid, controllerRegistryPath: controllerRegistryPath(), requiredTaskIds: [...asyncTasks].filter(([, e]) => e.parentSessionId === currentSessionId).map(([id]) => id), authorizeTask: (record: any) => { const entry = asyncTasks.get(record.taskId); return entry && !entry.recoveryManaged ? upgradeController!.retainCallback({ ...record, parentSessionPath: currentSessionFile }) : upgradeController!.claim({ ...record, parentSessionPath: currentSessionFile }); },
+					probe: async (record: any) => {
+						const query = await rmux.cmd("list-panes", "-a", "-F", "#{session_name}|#{window_name}|#{pane_dead}");
+						if (query.returnCode !== 0 || String(query.stdout || "").trim().split("\n").filter(Boolean).some(line => !/^.+\|.+\|[01]$/.test(line))) return { state: "unknown" };
+						const hit = parseRmuxTaskPanes(query.stdout, RMUX_SESSION_NAME).find((p: any) => p.taskId === record.taskId);
+						if (hit) return { state: hit.dead ? "dead" : "live", rmuxTarget: `${RMUX_SESSION_NAME}:${hit.windowName}.0` };
+						try {
+							const ps = String(execFileSync("ps", ["-axo", "command="], { timeout: 3000 }));
+							return ps.split("\n").some(line => line.trim().startsWith(`pi-subagent-${record.taskId}`)) ? { state: "live" } : { state: "dead" };
+						} catch { return { state: "unknown" }; }
+					} });
+				const keeper = output.records.length ? await startReceiverKeeper({ ledgerDir: ledgerDir(), registryPath: getWorkerRegistryPath() }) : null;
+				for (const record of output.records) {
+					const entry = asyncTasks.get(record.taskId);
+					if (entry && !entry.recoveryManaged) { legacyCallbacks.set(record.taskId, entry); upgradeController.retainCallback(record); continue; }
+					upgradeController.track(record); recoveryManagedTaskIds().add(record.taskId); if (entry) entry.recoveryManaged = true;
+				}
+				publishUpgradeManifest(output, keeper);
+				(globalThis as any).__pi_subagent_upgrade_prepared__ = currentSessionId;
+				pi.appendEntry("agent-upgrade-handoff", { parentSessionId: currentSessionId, taskIds: output.records.map((r: any) => r.taskId), preparedAt: Date.now(), keeper });
+				ctx.ui.notify(`Prepared ${output.records.length} RMUX task(s); workers were NOT restarted. Exit only the parent, then run:\n${output.command}${keeper ? `\nLegacy receiver keeper PID=${keeper.pid}, bound until ${new Date(keeper.expiresAt).toISOString()}` : ""}`, "info");
+			} catch (e: any) { ctx.ui.notify(`Prepare refused: ${e.message}. Do not exit until handoff succeeds.`, "error"); }
+		} });
 
 	pi.registerTool({
 		name: "subagent",
@@ -2587,7 +2720,9 @@ export default function (pi: ExtensionAPI) {
 		resumeSessionId?: string,  // 若提供，则用 --session <id> 重连既有会话而非新建
 		registryTaskText?: string,  // reload 时保留原始任务文本，避免续作提示中的讨论ID污染 item gate
 	): Promise<string> => {
+		const dispatchParentSessionId = currentSessionId;
 		assertSubagentSpawnAllowed();
+		assertNotUpgradePrepared();
 		let agent = agents.find((a) => a.name === agentName);
 		// _worker: 通用 worker，不依赖预注册 agent
 		if (!agent && agentName === "_worker") {
@@ -2659,6 +2794,7 @@ export default function (pi: ExtensionAPI) {
 					`export ${childExports} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
 
 				if (r.returnCode === 0) {
+					fs.appendFileSync(logPath, JSON.stringify({ type: "pi_subagent_launch", mode: "async-rmux", rmuxTarget }) + "\n");
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
 					const dummyProc = { killed: false, exitCode: null, kill: () => {} } as any;
 					asyncTasks.set(taskId, {
@@ -2681,6 +2817,7 @@ export default function (pi: ExtensionAPI) {
 
 					// 监控完成：轮询 pane 状态（returnCode 为 0 表示窗口/ pane 还活着，非 0 表示已消失=完成）
 					const pollInterval = setInterval(async () => {
+						if (recoveryManagedTaskIds().has(taskId)) { clearInterval(pollInterval); return; }
 						try {
 							const panes = await rmux.cmd("list-panes", "-t", rmuxTarget);
 							const isDead = panes.returnCode !== 0 || (panes.stdout?.includes("(dead)") ?? false);
@@ -2703,6 +2840,7 @@ export default function (pi: ExtensionAPI) {
 					}, 2000);
 
 					const handleCompletion = () => {
+							if (recoveryManagedTaskIds().has(taskId)) return;
 						// 主 agent 主动 kill（reload/stop）：只清理，不解析结果、不通知主会话
 						if (asyncTasks.get(taskId)?.intentionalKill) {
 							cleanup();
@@ -2746,10 +2884,20 @@ export default function (pi: ExtensionAPI) {
 									: finalText
 										? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
 										: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出。可用 /agent-results 查看。`;
-							sendCompletionToCurrentSession(pi, body);
+							sendCompletionToCurrentSession(pi, body, dispatchParentSessionId);
 						} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 					};
 
+					if (upgradeController && currentSessionFile) {
+						const entry = asyncTasks.get(taskId)!;
+						const reservation = readWorkerOwnershipRegistry(getWorkerRegistryPath()).workers[taskId];
+						try {
+							upgradeController.track({ taskId, parentSessionId: currentSessionId, parentSessionPath: currentSessionFile,
+								agent: agentName, task: taskText, cwd, mode: "async-rmux", rmuxTarget, logPath,
+								startTime: entry.startTime, ownershipToken: reservation?.ownerToken, itemKeys: reservation?.itemKeys });
+							recoveryManagedTaskIds().add(taskId); entry.recoveryManaged = true;
+						} catch (e) { console.warn("[subagent] task ledger failed; upgrade prepare required:", e); }
+					}
 					updateWidget();
 
 					return taskId;
@@ -2760,6 +2908,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ── fallback: spawn 方式 ──
+		fs.appendFileSync(logPath, JSON.stringify({ type: "pi_subagent_launch", mode: "async-spawn" }) + "\n");
 		const proc = spawn(process.execPath, [process.argv[1]!, ...piArgs], {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -2858,7 +3007,7 @@ export default function (pi: ExtensionAPI) {
 							: finalText
 								? `Agent "${agentName}" 结果${usageLine}:\n${finalText.slice(0, 4000)}`
 								: `Agent "${agentName}" (${taskId}) 已完成${usageLine}，但无文本输出。可用 /agent-results 查看。`;
-					sendCompletionToCurrentSession(pi, body);
+					sendCompletionToCurrentSession(pi, body, dispatchParentSessionId);
 				} catch (e) { console.warn("[subagent] completion notify failed:", e); }
 			}
 		});
@@ -2904,6 +3053,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionId = getTaskSessionId(taskId);
 		if (!sessionId) return `- ${taskId} (${entry.agent}): task session not in agent-logs yet, retry later`;
 		if (!(await killTask(taskId))) return `- ${taskId} (${entry.agent}): kill failed, session not resumed to avoid double-running`;
+		if (entry.recoveryManaged) { unregisterWorker(taskId); asyncTasks.delete(taskId); }
 		// resume 用**真实会话文件路径**而非 id:pi --session <id> 会把 id 解析到
 		// subagent-task-* 镜像(头 id 相同),导致 getSessionFile 返回镜像、
 		// 注册表/@pi_session 指向镜像 —— desktop 去重后真实会话拿不到
@@ -2964,8 +3114,8 @@ export default function (pi: ExtensionAPI) {
 			let output = "Recent agent results:\n";
 			for (let i = branch.length - 1; i >= 0 && count < 5; i--) {
 				const entry = branch[i];
-				if (entry.type === "entry" && (entry.value as any)?.key?.startsWith("agent:")) {
-					const v = entry.value as any;
+				if (entry.type === "custom" && entry.customType === "agent" && (entry.data as any)?.key?.startsWith("agent:")) {
+					const v = (entry.data as any).value;
 					output += `\n/${v.agent} (${v.exitCode === 0 ? "✓" : "✗"}): ${v.summary}`;
 					count++;
 				}
@@ -3110,12 +3260,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_list",
 		label: "Subagent List",
-		description: "List currently running subagents with their task id, agent name, pi session id and task description. Main sessions see all workers; worker callers see only descendants they are allowed to manage. The current worker is never returned as its own subagent.",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		description: "List running subagents belonging to the current main session and its task tree by default. Use scope=machine explicitly for machine-wide inspection from a main session. Worker callers see only descendants they are allowed to manage and cannot request machine scope. The current worker is never returned as its own subagent.",
+		parameters: Type.Object({
+			scope: Type.Optional(StringEnum(["session", "machine"], { description: "Visibility scope. Default: session (this main session's task tree). machine is explicit main-only inspection.", default: "session" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const discovered = findRunningTasks({}, true);
-			const scope = managementScopeForCurrentWorker();
-			const all = scope === null ? discovered : discovered.filter(({ taskId }) => scope.has(taskId));
+			const scope = params.scope ?? "session";
+			const sessionId = ctx.sessionManager?.getSessionId?.() || "";
+			const all = selectListedTasks(discovered, discoverTaskRelations(), { sessionId, workerTaskId: CURRENT_WORKER_TASK_ID, scope });
 			const lines = all.map(({ taskId, entry }) => {
 				const actualSessionId = getTaskSessionId(taskId);
 				if (actualSessionId) entry.sessionId = actualSessionId;
@@ -3126,13 +3279,13 @@ export default function (pi: ExtensionAPI) {
 					: entry.parentSessionId ? ` parentSession=${entry.parentSessionId}` : " parent=unknown";
 				return `- ${taskId} agent=${entry.agent}${sess}${parent} rmux=${entry.useRmux ? "yes" : "no"}${fmtUsageShort(entry.usage)} task="${entry.task.slice(0, 100)}"`;
 			});
-			void ctx;
 			return {
 				content: [{ type: "text", text: all.length
 					? lines.join("\n")
 					: CURRENT_WORKER_TASK_ID
 						? `No running descendant subagents. Current worker ${CURRENT_WORKER_TASK_ID} cannot stop/reload itself.`
-						: "No running subagents." }],
+						: scope === "machine" ? "No running subagents on this machine." : "No running subagents belonging to the current session." }],
+				details: { scope, sessionId, taskIds: all.map(({ taskId }) => taskId) },
 			};
 		},
 	});
@@ -3369,6 +3522,8 @@ export default function (pi: ExtensionAPI) {
 	// 删除后 desktop 会走兜底;下一个 session_start 会重新写入正确条目。
 	// reload 时模块重载会重复注册,unlink 同一文件幂等,无副作用。
 	pi.on("session_shutdown", () => {
+		upgradeController?.close();
+		upgradeController = null;
 		try {
 			fs.unlinkSync(path.join(getAgentDir(), "runtime", `${process.pid}.jsonl`));
 		} catch { /* 文件可能不存在,忽略 */ }
@@ -3389,13 +3544,36 @@ export default function (pi: ExtensionAPI) {
 		sessionUI = ctx.ui;
 		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
 		currentSessionFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
+		if (currentSessionFile && fs.existsSync(currentSessionFile)) currentSessionFile = fs.realpathSync(currentSessionFile);
+		if (!CURRENT_WORKER_TASK_ID && currentSessionFile && currentSessionId) {
+			upgradeController?.close();
+			upgradeController = createUpgradeController(ctx);
+			try { await upgradeController.recover(); }
+			catch (e) { console.warn("[subagent] recovery failed:", e); }
+		}
 		// Completion callbacks from a pre-/reload or pre-/new extension instance
 		// survive with asyncTasks. Route them through the newest session API.
-		(globalThis as any)[GLOBAL_COMPLETION_SENDER_KEY] = (body: string) =>
+		(globalThis as any)[GLOBAL_COMPLETION_SENDER_KEY] = (body: string, originId?: string) => {
+			if (!originId) {
+				const agent = /^Agent "([^"]+)"/.exec(body)?.[1];
+				const matches = [...legacyCallbacks].filter(([id, e]) => body.includes(id) || (agent && e.agent === agent));
+				const parents = new Set(matches.map(([, e]) => e.parentSessionId).filter(Boolean));
+				if (parents.size !== 1) { console.warn("[subagent] legacy completion has ambiguous parent; inspect its saved log or recover the original session"); return; }
+				originId = [...parents][0];
+				if (originId === currentSessionId && matches.length === 1) {
+					const [taskId] = matches[0];
+					try { if (upgradeController?.leases.has(taskId)) upgradeController.fence(taskId); }
+					catch { console.warn("[subagent] legacy completion lost controller authority; saved log retained"); return; }
+					body = `[subagent resultId=${taskId}:completion] ${body}`;
+				}
+			}
+			if (originId !== currentSessionId) { console.warn(`[subagent] completion belongs to ${originId}; delivery to current ${currentSessionId} refused; saved log/ledger retained`); return; }
 			pi.sendUserMessage(body, { deliverAs: "steer" });
+		};
 		// reload 后 asyncTasks 保存在 globalThis，重新把仍存活的任务注册给
 		// watcher 路由；否则新模块会把它们误判成 stale target。
 		for (const [id, entry] of asyncTasks) {
+			if (entry.recoveryManaged || entry.parentSessionId !== currentSessionId) continue;
 			registerWorker(id, entry.cwd || (ctx as any).cwd || process.cwd(), entry.task);
 		}
 		// reload 安全:把会话状态存到 globalThis,新模块加载时恢复
