@@ -120,6 +120,8 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
 
 Older `--parent-pid` calls remain accepted only as assertions against the independently resolved identity; they cannot select or override a PID. Do not clear the registry, stop the existing item owner, or exit the parent to bypass a preparation refusal. Require a successful handoff first.
 
+Controller heartbeats run independently of RMUX probes. If this controller's authenticated lease expires without a takeover, it atomically acquires a **new fenced epoch**, never revives the expired epoch. A different holder/generation is quarantined locally until explicit reconciliation; worker processes and disk state are retained. Slow probes have bounded waits and one pending slot per task. Background errors are recorded once with a persistent status, not repeatedly printed over the TUI. After loading this fix, `/reload` in an idle main replaces the old recovery timer without restarting workers; do not delete leases or restart all subagents to stop a console-error loop.
+
 ### Persistence and delivery boundaries
 
 - `<agent-dir>/agent-upgrades/<parentSessionId>.json` is the ready manifest required by the versioned launcher; a session path alone is not a handoff.

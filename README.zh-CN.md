@@ -120,6 +120,8 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
 
 旧的 `--parent-pid` 调用仅作为与自动解析结果一致性的断言保留，不能选择或覆盖 PID。不要为绕过准备失败而清空注册表、停止现有事项 owner，或提前退出主代理。必须先确认交接成功。
 
+Controller 心跳独立于 RMUX 探测执行。若当前 controller 的已认证租约到期、且没有其他 controller 接管，它会原子获取**新的 fencing epoch**，不会复活过期 epoch。发现其他 holder/generation 时只隔离本地自动恢复，等待显式对账，保留 worker 进程及磁盘状态。慢探测有超时上限，同任务仅保留一个在途探测。后台错误只记录一次并显示持久状态，不再反复向 TUI 打印刷屏。加载修复后，在空闲主会话执行 `/reload` 即可替换旧恢复定时器，不重启 worker；不要通过删租约或重启全部 subagent 来压制错误循环。
+
 ### 持久化与投递边界
 
 - `<agent-dir>/agent-upgrades/<parentSessionId>.json` 是版本 launcher 必须验证的 ready manifest；仅提供会话路径不等于完成交接。

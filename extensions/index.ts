@@ -52,7 +52,7 @@ import {
 } from "./safety.mjs";
 import { resolveDispatchConfig } from "./dispatch.mjs";
 import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
-import { RecoveryController, probeRmuxTask, readTaskRecords } from "./recovery.mjs";
+import { RecoveryController, probeRmuxTask, readTaskRecords } from "./recovery-v2.mjs";
 import { prepareUpgrade, publishUpgradeManifest } from "./upgrade-handoff-v2.mjs";
 import { selectListedTasks } from "./list-scope.mjs";
 import { startReceiverKeeper } from "./receiver-keeper.mjs";
@@ -2005,6 +2005,7 @@ export default function (pi: ExtensionAPI) {
 	const notifyDir = () => path.dirname(getWorkerRegistryPath());
 	const controllerRegistryPath = () => path.join(ledgerDir(), ".controllers.json");
 	const createUpgradeController = (ctx: any) => {
+		const reportedRecoveryErrors = new Set<string>();
 		const parentId = ctx.sessionManager.getSessionId();
 		const rawParentPath = ctx.sessionManager.getSessionFile();
 		const parentPath = fs.existsSync(rawParentPath) ? fs.realpathSync(rawParentPath) : rawParentPath;
@@ -2057,7 +2058,17 @@ export default function (pi: ExtensionAPI) {
 				workerOwnerships().delete(record.taskId); asyncTasks.delete(record.taskId);
 				renderSubagentWidget(ctx.ui);
 			},
-			onError: (error: any) => console.warn("[subagent] recovery:", error.message),
+			onError: (error: any, record?: any) => {
+				const message = String(error?.message || error);
+				const fingerprint = `${record?.taskId || "controller"}:${error?.code || message}`;
+				if (reportedRecoveryErrors.has(fingerprint)) return;
+				reportedRecoveryErrors.add(fingerprint);
+				// Background faults must never bypass TUI rendering every poll.
+				// Persist diagnostics and one status indication, not console spam
+				// or agent messages that provoke more recovery/model activity.
+				diagLog(`recovery ${fingerprint}: ${message}`);
+				if (currentSessionId === parentId) ctx.ui?.setStatus?.("subagent-recovery", `Recovery paused: ${record?.taskId || "controller"}; /agent:recover to reconcile`);
+			},
 		});
 	};
 	pi.registerCommand("agent:recover", { description: "Reconcile durable RMUX tasks for this exact parent session (no worker restart)",

@@ -63,10 +63,10 @@ globalThis.__fixtureRecoveryStage = stage => {
 const logPath = path.join(root, "agent-logs", `${taskId}.jsonl`);
 fs.writeFileSync(logPath, '{"type":"agent_settled"}\n');
 atomicRecoveryWrite(taskRecordPath(path.join(root, "durable-tasks"), taskId), { version: 1, taskId, mode: "async-rmux", parentSessionId: parentId, parentSessionPath: parentPath, agent: "fixture", task: "fixture", cwd: root, rmuxTarget: target, logPath });
-const commands = new Map(), tools = new Map(), handlers = new Map(), entries = [], sent = [], queued = [], notices = [];
+const commands = new Map(), tools = new Map(), handlers = new Map(), entries = [], sent = [], queued = [], notices = [], statusUpdates = [];
 const ctx = { cwd: root, isIdle: () => true, model: { id: "fixture", provider: "fixture" },
   sessionManager: { getSessionId: () => parentId, getSessionFile: () => parentAlias, getEntries: () => entries, getBranch: () => entries },
-  ui: { setStatus(){}, setWidget(){}, theme:{fg:(_c,s)=>s}, notify:(s)=>notices.push(s) } };
+  ui: { setStatus:(key,value)=>statusUpdates.push({key,value}), setWidget(){}, theme:{fg:(_c,s)=>s}, notify:(s)=>notices.push(s) } };
 const pi = { on:(n,f)=>handlers.set(n,f), registerTool:t=>tools.set(t.name,t), registerCommand:(n,d)=>commands.set(n,d), registerShortcut(){}, getActiveTools:()=>[],
   appendEntry:(customType,data)=>{entries.push({type:"custom",customType,data});fs.appendFileSync(parentPath, JSON.stringify(entries.at(-1))+"\n");},
   sendUserMessage:s=>{sent.push(s);queued.push(s);} };
@@ -85,11 +85,11 @@ try {
   fs.writeFileSync(mockRecovery, `export * from ${JSON.stringify(path.resolve("extensions/recovery.mjs"))};
     import {RecoveryController as RealController} from ${JSON.stringify(path.resolve("extensions/recovery.mjs"))};
     export class RecoveryController extends RealController {
-      constructor(options){globalThis.__fixtureRecoveryStage?.('constructor');super(options);this.firstRecovery=true}
+      constructor(options){globalThis.__fixtureRecoveryStage?.('constructor');super(options);globalThis.__fixtureControllerOptions=options;this.firstRecovery=true}
       async recover(){if(this.firstRecovery){this.firstRecovery=false;globalThis.__fixtureRecoveryStage?.('recover')}return super.recover()}
     }`);
   let bundledSource = replacePeers(source);
-  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : name === "recovery.mjs" ? mockRecovery : path.resolve("extensions", name)));
+  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : (name === "recovery.mjs" || name === "recovery-v2.mjs") ? mockRecovery : path.resolve("extensions", name)));
   const input = path.join(root, "index.ts"); fs.writeFileSync(input, bundledSource);
   execFileSync("npx", ["--no-install", "esbuild", input, "--bundle", "--platform=node", "--format=esm", `--outfile=${file}`], { stdio: "pipe" });
   const extension = await import(pathToFileURL(file));
@@ -118,6 +118,11 @@ try {
   assert.equal(readWorkerOwnershipRegistry(registryPath).workers[refusedId].ownerToken,"real-token","restore refusal preserves the actual reservation");
   globalThis.__pi_subagent_async_tasks__.delete(refusedId);globalThis.__pi_subagent_worker_ownerships__.delete(refusedId);
   assert.ok(globalThis.__pi_subagent_async_tasks__.get(taskId)?.recoveryManaged, "session_start rebuilds the managed live task");
+  const beforeFaultWarnings=warnings.length;
+  const fault=Object.assign(new Error("simulated repeated controller expiry"),{code:"LEASE_EXPIRED"});
+  for(let n=0;n<20;n++)globalThis.__fixtureControllerOptions.onError(fault,{taskId});
+  assert.equal(warnings.length,beforeFaultWarnings,"background recovery errors never spam console/TUI stdout");
+  assert.equal(statusUpdates.filter(s=>s.key==="subagent-recovery").length,1,"one persistent status per task/error, not one popup per poll");
   assert.equal(globalThis.__pi_subagent_async_tasks__.get(legacyId),legacyEntry,"reload preserves the existing callback-owned entry");
   assert.equal(legacyEntry.recoveryManaged,undefined,"legacy callback is not adopted by a second completion monitor");
   const leases=JSON.parse(fs.readFileSync(path.join(root,"durable-tasks",".controllers.json"))).leases;
@@ -252,6 +257,6 @@ try {
   Date.now = originalNow;
   if(oldNotify===undefined)delete process.env.PI_AGENT_NOTIFY_DIR;else process.env.PI_AGENT_NOTIFY_DIR=oldNotify;
   if(oldTask===undefined)delete process.env.PI_SUBAGENT_TASK_ID;else process.env.PI_SUBAGENT_TASK_ID=oldTask;
-  delete globalThis.__fixtureRmux;delete globalThis.__fixtureRuntimeRename;delete globalThis.__fixtureRecoveryStage;
+  delete globalThis.__fixtureRmux;delete globalThis.__fixtureRuntimeRename;delete globalThis.__fixtureRecoveryStage;delete globalThis.__fixtureControllerOptions;
   fs.rmSync(root,{recursive:true,force:true});
 }

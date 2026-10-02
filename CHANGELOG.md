@@ -26,6 +26,9 @@
 
 ### Fixed / 修复
 
+- **Controller-expiry/TUI recovery loop:** an expired authenticated controller now acquires a new fenced epoch only if PID/parent/token/generation remain unchanged; a takeover quarantines local automatic polling instead of repeatedly retrying or stealing authority. Heartbeats are independent of slow probes; bounded single-slot probes cannot starve other leases or accumulate requests. Background errors are logged once and shown as status, never repeated console output over the TUI. Reload imports the versioned recovery implementation to replace an old cached timer without restarting workers.
+  **Controller 到期与 TUI 恢复死循环：** 已认证 controller 到期时，仅在 PID/parent/token/generation 未变的情况下取得新的 fencing epoch；被接管则隔离本地自动轮询，不重复重试或夺权。心跳独立于慢探测，有界、单槽探测不会饿死其他租约或堆积请求。后台错误只记录一次并显示状态，不再反复向 TUI 控制台输出刷屏。Reload 使用版本化 recovery 实现，替换旧缓存定时器而不重启 worker。
+
 - **Authenticated reload refresh:** preserve an existing worker's original domain keys, token, PID and cwd instead of re-deriving item ownership from a resume/steering prompt. An incidental number in batch context can no longer rebind a worker to a different occupied item. Restore refuses wrong credentials or missing reservations; one refusal does not abort parent runtime registration.
   **经验证的 reload 刷新：** 保留已有 worker 原 domain keys、token、PID 和 cwd，不从恢复/追加指令重新派生事项所有权。批次上下文中的其他数字不再把 worker 重绑到另一已占用事项。错误凭据或缺失 reservation 仍拒绝恢复；单个拒绝不再中断主 runtime 登记。
 
@@ -48,6 +51,9 @@
   **保守处理恢复失败：** RMUX 查询错误保持 `unknown`，不误报完成；不强行重建缺失 ownership、不覆盖活跃的其他 token；准备失败不会发布 ready 授权，已完成但未跟踪的历史不会作为新任务重放。不同主会话须逐一交接。
 
 ### Tests / 测试
+
+- Added isolated expiry/new-epoch, atomic takeover-race, quarantine-once, independent-heartbeat, hung-probe, safe-close and stale-class-cache regressions, plus an extension-host check that repeated errors produce one status and no console spam.
+  新增隔离的到期/新 epoch、原子接管竞态、一次性隔离告警、独立心跳、挂起探测、安全关闭和旧 class 缓存回归，以及扩展 host 中重复错误只产生一个状态、不刷控制台的验证。
 
 - Added a real JITI/native ESM warm-cache reproduction and versioned dependency recovery, reservation credential/key preservation checks, extension-host reload collisions, early/atomic runtime publication and shutdown lifecycle tests, and automatic identity resolution across same-cwd sessions, missing slots and conflicting live claims using disposable state.
   新增真实 JITI/原生 ESM 热缓存复现及版本化依赖恢复、reservation 凭据/key 保留、扩展 host reload 事项碰撞、提前/原子 runtime 登记与 shutdown 生命周期，以及同 cwd 多会话、缺失槽和冲突活跃归属的自动身份解析测试；全部使用临时状态。
