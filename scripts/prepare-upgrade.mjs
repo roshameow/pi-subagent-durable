@@ -8,6 +8,7 @@ import { execFileSync } from "node:child_process";
 import { startReceiverKeeper } from "../extensions/receiver-keeper.mjs";
 import { prepareUpgrade, publishUpgradeManifest } from "../extensions/upgrade-handoff-v2.mjs";
 import { preserveMainNotifyIdentity } from "../extensions/main-notify-handoff.mjs";
+import { resolveParentIdentity } from "../extensions/parent-identity.mjs";
 
 const args = process.argv.slice(2);
 let requestedSession, explicitParentPid, validArgs = true;
@@ -18,7 +19,7 @@ for (let i = 0; i < args.length; i += 2) {
   else { validArgs = false; break; }
 }
 if (!validArgs || !requestedSession || (explicitParentPid !== undefined && (!Number.isInteger(explicitParentPid) || explicitParentPid < 2 || explicitParentPid > 2147483647))) {
-  console.error("Usage: node scripts/prepare-upgrade.mjs --session /absolute/canonical-parent.jsonl [--parent-pid VERIFIED_LIVE_MAIN_PID]"); process.exitCode = 1;
+  console.error("Usage: node scripts/prepare-upgrade.mjs --session /absolute/canonical-parent.jsonl"); process.exitCode = 1;
 } else {
   try {
     const parentSessionPath = fs.realpathSync(requestedSession);
@@ -27,29 +28,16 @@ if (!validArgs || !requestedSession || (explicitParentPid !== undefined && (!Num
     const header = JSON.parse(buffer.subarray(0, bytes).toString("utf8").split("\n")[0]);
     const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
     const notifyDir = process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify";
-    // The legacy parent's runtime slot binds its PID to this canonical file.
-    const runtimeDir = path.join(agentDir, "runtime");
-    let runtimeFiles;
-    try { runtimeFiles = fs.readdirSync(runtimeDir); } catch (error) { if (error.code !== "ENOENT") throw error; runtimeFiles = []; }
-    const owners = runtimeFiles.flatMap(name => {
-      try {
-        const row = JSON.parse(fs.readFileSync(path.join(runtimeDir, name), "utf8"));
-        if (row.type !== "pi_runtime" || fs.realpathSync(row.sessionPath) !== parentSessionPath) return [];
-        process.kill(row.pid, 0); return [row];
-      } catch { return []; }
-    });
-    if (owners.length > 1) throw new Error(`expected exactly one live canonical parent runtime, found ${owners.length}`);
-    if (owners.length === 1 && explicitParentPid !== undefined && Number(owners[0].pid) !== explicitParentPid) throw new Error("explicit parent PID conflicts with the canonical runtime slot");
-    if (owners.length === 0 && explicitParentPid === undefined) throw new Error("no live canonical parent runtime; after a failed reload, verify the exact main PID and supply --parent-pid (never guess it)");
-    const parentPid = owners.length ? Number(owners[0].pid) : explicitParentPid;
-    // Failed session_start can remove the old runtime slot before writing its
-    // replacement. An explicit operator-verified PID may use the separately
-    // validated fresh main-notify identity; it never overrides another runtime.
+    const identity = resolveParentIdentity({ agentDir, notifyDir, parentSessionId: header.id, parentSessionPath, cwd: header.cwd });
+    const parentPid = identity.parentPid;
+    // Retain old CLI calls as assertions only; they cannot choose or override
+    // the independently resolved identity. Normal operation needs no PID flag.
+    if (explicitParentPid !== undefined && explicitParentPid !== parentPid) throw new Error("provided parent PID conflicts with the automatically verified main identity");
     const mainIdentityPath = preserveMainNotifyIdentity({
       notifyDir, notifyStateDir: process.env.PI_AGENT_NOTIFY_STATE_DIR || path.join(os.homedir(), ".pi", "agent", "agent-notify"),
       parentSessionId: header.id, parentSessionPath, parentPid, cwd: header.cwd,
     });
-    if (!owners.length) console.log(`Verified exact main-notify registration for explicitly selected parent PID=${parentPid}; runtime slot was absent.`);
+    console.log(`Automatically verified parent identity via ${identity.source}; no manual PID selection required.`);
     const query = String(execFileSync("rmux", ["list-panes", "-a", "-F", "#{session_name}|#{window_name}|#{pane_dead}"], { timeout: 5000, stdio: ["ignore", "pipe", "pipe"] }));
     const panes = query.trim().split("\n").filter(Boolean).map(line => {
       const parts = line.split("|"); if (parts.length !== 3 || !["0", "1"].includes(parts[2])) throw new Error("unrecognized RMUX pane response"); return parts;

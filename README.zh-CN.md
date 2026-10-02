@@ -99,7 +99,7 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
   --session '/absolute/canonical-parent.jsonl'
 ```
 
-执行 bootstrap **之前**，让原主代理保持空闲、没有待处理的对话工作，并停止派发新任务。脚本验证只有一个存活且对应 canonical 主会话的 runtime 注册，以及新鲜、精确匹配的 main-notify 注册；将旧 main 的原始 runId/nonce 导入 `<notify-state-dir>/main-identities/`，设置 24 小时的离线身份边界；随后迁移现有异步 RMUX worker，不加载 Pi，也不向 worker 发信号。必须看到成功的 `Prepared …` 和 `Preserved exact main notification identity …` 输出，核对预期任务数及 keeper PID/截止时间，然后立即只退出原主代理。旧代码不能自动冻结派发；版本 launcher 会检测交接遗漏、准备后新派发且仍存活的任务。出现拒绝时，**先不要退出**。如已配置 `PI_CODING_AGENT_DIR`、`PI_AGENT_NOTIFY_DIR`、`PI_AGENT_NOTIFY_STATE_DIR`，必须保持原值。
+执行 bootstrap **之前**，让原主代理保持空闲、没有待处理的对话工作，并停止派发新任务。脚本自动验证精确、存活且新鲜的 main-notify 注册，并交叉核验可用的 runtime 槽；将旧 main 的原始 runId/nonce 导入 `<notify-state-dir>/main-identities/`，设置 24 小时的离线身份边界；随后迁移现有异步 RMUX worker，不加载 Pi，也不向 worker 发信号。必须看到成功的 `Prepared …` 和 `Preserved exact main notification identity …` 输出，核对预期任务数及 keeper PID/截止时间，然后立即只退出原主代理。旧代码不能自动冻结派发；版本 launcher 会检测交接遗漏、准备后新派发且仍存活的任务。出现拒绝时，**先不要退出**。如已配置 `PI_CODING_AGENT_DIR`、`PI_AGENT_NOTIFY_DIR`、`PI_AGENT_NOTIFY_STATE_DIR`，必须保持原值。
 
 如果仍有意 reload 旧主代理以加载这些命令，现有内存中的 legacy 回调会保留：恢复仅续期它们的 controller 权限，**不会**增加第二套完成监控。只有缺失的外部任务或已由 recovery 管理的任务才会重建监控。Reload 不会降级 receiver ownership。Legacy 完成 steering 保守绑定到原主会话；执行 `/new` 后，结果延后保存在原日志/账本中，而不注入新会话。来源不明确的 legacy 投递会被拒绝。首次迁移仍建议 bootstrap，因为它无需 reload 旧回调代码。
 
@@ -109,14 +109,16 @@ Reload 必须保留已有 worker 经验证的 item keys/token。恢复或追加�
 
 Pi 的 `/reload` 会清理扩展 factory，但 Node 可能保留原生 `.mjs` namespace。新 runtime 使用带版本的 registry/handoff 入口，避开旧 namespace 缺少新增 export 的错误。兼容 shim 无法刷新进程里已加载的 namespace；未来 ABI 变化仍需新模块版本或新进程。计划升级优先使用外部 bootstrap。
 
-如果此前失败的 reload 已删除主 runtime 槽、尚未写入替代槽，bootstrap 默认拒绝。操作者独立核验进程后，可显式提供 `--parent-pid VERIFIED_LIVE_MAIN_PID`。此补救仍强制校验**精确、新鲜的 main-notify 注册**，PID/canonical 会话/cwd 必须匹配；存在冲突或多个 runtime 时仍拒绝，不按 cwd 猜 PID，也不绕过 worker ownership：
+主身份会在 controller/worker 恢复**之前**原子登记，随后再补充 TTY/RMUX 信息。`/reload` 保留同一进程/会话的槽；退出或切换会话才删除。单个 controller 或任务失败不会再抹掉主身份。
+
+如果旧版失败的 reload 已丢失 runtime 槽，外部 bootstrap 会自动从**精确、新鲜的 main-notify 注册**解析 PID，核验 canonical 会话/header/cwd 和进程存活，并交叉检查已有 runtime。无需人工查 PID，也不需要逐会话修补。身份冲突、多个活跃 runtime、陈旧注册或缺少可信证据时仍保守拒绝。正常命令不变：
 
 ```bash
 node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
-  --session '/absolute/canonical-parent.jsonl' --parent-pid VERIFIED_LIVE_MAIN_PID
+  --session '/absolute/canonical-parent.jsonl'
 ```
 
-不要为绕过准备失败而清空注册表、停止现有事项 owner，或提前退出主代理。必须先确认交接成功。
+旧的 `--parent-pid` 调用仅作为与自动解析结果一致性的断言保留，不能选择或覆盖 PID。不要为绕过准备失败而清空注册表、停止现有事项 owner，或提前退出主代理。必须先确认交接成功。
 
 ### 持久化与投递边界
 

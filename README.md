@@ -99,7 +99,7 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
   --session '/absolute/canonical-parent.jsonl'
 ```
 
-Keep the original parent idle with no pending conversation work and stop dispatching new work **before** invoking the bootstrap. It verifies exactly one live parent runtime slot and a fresh exact main-notify registration, imports the old main's exact runId/nonce into `<notify-state-dir>/main-identities/` with a 24-hour offline identity bound, and migrates existing async RMUX workers without loading Pi or signaling them. Require successful `Prepared …` and `Preserved exact main notification identity …` output, check the expected task count and keeper PID/deadline, then exit only that parent immediately. The old code cannot automatically freeze dispatch; the versioned launcher detects still-live late tasks omitted from the handoff. A refusal means **do not exit yet**. Keep the same `PI_CODING_AGENT_DIR`, `PI_AGENT_NOTIFY_DIR` and `PI_AGENT_NOTIFY_STATE_DIR` overrides if configured.
+Keep the original parent idle with no pending conversation work and stop dispatching new work **before** invoking the bootstrap. It automatically verifies the exact live main-notify registration and cross-checks available runtime slots, imports the old main's exact runId/nonce into `<notify-state-dir>/main-identities/` with a 24-hour offline identity bound, and migrates existing async RMUX workers without loading Pi or signaling them. Require successful `Prepared …` and `Preserved exact main notification identity …` output, check the expected task count and keeper PID/deadline, then exit only that parent immediately. The old code cannot automatically freeze dispatch; the versioned launcher detects still-live late tasks omitted from the handoff. A refusal means **do not exit yet**. Keep the same `PI_CODING_AGENT_DIR`, `PI_AGENT_NOTIFY_DIR` and `PI_AGENT_NOTIFY_STATE_DIR` overrides if configured.
 
 If you deliberately reload an older parent to load these commands, existing in-memory legacy callbacks are retained: recovery renews their controller authority but does **not** install a second completion monitor. Only missing external tasks or already recovery-managed tasks get rebuilt monitors. Receiver ownership is not downgraded during reload. Legacy completion steering is bound conservatively to its original parent; after `/new`, it is deferred to the original saved log/ledger rather than injected into the new session. Ambiguous legacy origins are refused. The bootstrap remains preferable because it needs no reload of old callback code.
 
@@ -109,14 +109,16 @@ Reload must preserve an existing worker's authenticated item keys/token; a resum
 
 Pi clears extension factories on `/reload`, but Node can retain native `.mjs` namespaces. New runtime code uses versioned registry/handoff entry points to avoid old namespaces missing newly added exports. Compatibility shims cannot refresh a namespace already loaded in a process; future ABI changes need a new module version or a fresh process. Prefer the external bootstrap for planned upgrades.
 
-If an earlier failed reload removed the parent's runtime slot before writing its replacement, the bootstrap normally refuses. An operator may supply `--parent-pid VERIFIED_LIVE_MAIN_PID` after independently checking that process. This fallback still requires the **exact, fresh main-notify registration**, matching PID/canonical session/cwd, and refuses conflicting or multiple runtime slots; it does not guess a PID from cwd or bypass worker ownership:
+Runtime identity is registered atomically **before** controller/worker recovery and enriched with TTY/RMUX data afterward. `/reload` retains the same process/session slot; quit or session replacement removes it. A controller or task failure does not erase the main identity.
+
+If an older failed reload already lost that slot, the external bootstrap automatically resolves the PID from the **exact, fresh main-notify registration**, checks canonical session/header/cwd and process liveness, and corroborates any available runtime slots. No manual PID selection or per-session repair is required. Conflicting bindings, multiple live runtimes, stale identity or missing authoritative evidence still fail closed. The normal command stays:
 
 ```bash
 node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
-  --session '/absolute/canonical-parent.jsonl' --parent-pid VERIFIED_LIVE_MAIN_PID
+  --session '/absolute/canonical-parent.jsonl'
 ```
 
-Do not clear the registry, stop the existing item owner, or exit the parent to bypass a preparation refusal. Require a successful handoff first.
+Older `--parent-pid` calls remain accepted only as assertions against the independently resolved identity; they cannot select or override a PID. Do not clear the registry, stop the existing item owner, or exit the parent to bypass a preparation refusal. Require a successful handoff first.
 
 ### Persistence and delivery boundaries
 

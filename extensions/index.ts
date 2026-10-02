@@ -23,6 +23,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionContext,
 	getAgentDir,
 	getMarkdownTheme,
 	parseFrontmatter,
@@ -1345,6 +1346,55 @@ function diagLog(msg: string) {
 try {
 	diagLog(`loaded; rmux=${checkRmuxAvailable()}`);
 } catch {}
+
+// Runtime identity is independent of worker/controller authority. Always read
+// the active SDK session, never the reload-surviving widget globals.
+function activeSessionIdentity(ctx: ExtensionContext) {
+	const sessionId = ctx.sessionManager.getSessionId() || "";
+	const file = ctx.sessionManager.getSessionFile() || "";
+	return { sessionId, sessionPath: file && fs.existsSync(file) ? fs.realpathSync(file) : file };
+}
+
+function writeRuntimeRegistration(
+	ctx: ExtensionContext,
+	startedAt: number,
+	transport: { tty: string; panePid: number | null } = { tty: "", panePid: null },
+): boolean {
+	let temp = "";
+	try {
+		const identity = activeSessionIdentity(ctx);
+		if (!identity.sessionPath) return false; // ephemeral SDK session
+		const dir = path.join(getAgentDir(), "runtime");
+		fs.mkdirSync(dir, { recursive: true });
+		const slot = path.join(dir, `${process.pid}.jsonl`);
+		temp = `${slot}.${crypto.randomUUID()}.tmp`;
+		const fd = fs.openSync(temp, "wx", 0o600);
+		try {
+			fs.writeFileSync(fd, JSON.stringify({
+				type: "pi_runtime", pid: process.pid, ...identity,
+				cwd: ctx.cwd || "", startedAt, ...transport,
+			}) + "\n", "utf8");
+			fs.fsyncSync(fd);
+		} finally { fs.closeSync(fd); }
+		fs.renameSync(temp, slot);
+		return true;
+	} catch (error) {
+		const message = `runtime reg ERR ${String(error)}`;
+		diagLog(message);
+		console.warn(`[subagent] ${message}`);
+		return false;
+	} finally {
+		if (temp) {
+			try { fs.unlinkSync(temp); }
+			catch (error: any) {
+				if (error.code !== "ENOENT") {
+					diagLog(`runtime tmp cleanup ERR ${String(error)}`);
+					console.warn("[subagent] runtime tmp cleanup failed:", error);
+				}
+			}
+		}
+	}
+}
 
 // ── subagent 管理辅助：主 agent 可直接 kill / 重连运行中的子 agent ──
 
@@ -3528,19 +3578,30 @@ export default function (pi: ExtensionAPI) {
 	// ── session_start: footer + UI 引用 + 周期刷新子代理 widget ──
 	// 单引号转义(rmux 选项值)
 	const sq = (x: string) => `'${x.replace(/'/g, "'\\''")}'`;
-	// /new /resume /exit 时删除自己的注册表条目:避免 stale 指向已删会话
-	//(/new 中断时新会话文件可能被 pi 删除,条目就指向不存在了)。
-	// 删除后 desktop 会走兜底;下一个 session_start 会重新写入正确条目。
-	// reload 时模块重载会重复注册,unlink 同一文件幂等,无副作用。
-	pi.on("session_shutdown", () => {
-		upgradeController?.close();
-		upgradeController = null;
-		try {
-			fs.unlinkSync(path.join(getAgentDir(), "runtime", `${process.pid}.jsonl`));
-		} catch { /* 文件可能不存在,忽略 */ }
+	// /reload keeps the same SDK session and Pi PID: retain its runtime slot
+	// across extension teardown. Quit/session replacement must discard it.
+	pi.on("session_shutdown", (event) => {
+		try { upgradeController?.close(); }
+		catch (error) { diagLog(`controller close ERR ${String(error)}`); console.warn("[subagent] controller close failed:", error); }
+		finally {
+			upgradeController = null;
+			if (event?.reason !== "reload") {
+				try { fs.unlinkSync(path.join(getAgentDir(), "runtime", `${process.pid}.jsonl`)); }
+				catch (error: any) {
+					if (error.code !== "ENOENT") { diagLog(`runtime unregister ERR ${String(error)}`); console.warn("[subagent] runtime unregister failed:", error); }
+				}
+			}
+		}
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		const identity = activeSessionIdentity(ctx);
+		currentSessionId = identity.sessionId;
+		currentSessionFile = identity.sessionPath;
+		const runtimeStartedAt = Date.now();
+		// Publish accurate identity before any recovery/ownership helper can
+		// await or fail. TTY/RMUX discovery only enriches this atomic base slot.
+		writeRuntimeRegistration(ctx, runtimeStartedAt);
 		const safety = readSubagentSafetyConfig();
 		if (process.env.PI_SUBAGENT_TASK_ID) {
 			try { process.title = `pi-subagent-${process.env.PI_SUBAGENT_TASK_ID}`.slice(0, 120); } catch {}
@@ -3553,14 +3614,19 @@ export default function (pi: ExtensionAPI) {
 		}
 		ensureWorkerOwnershipHeartbeat();
 		sessionUI = ctx.ui;
-		currentSessionId = (ctx as any).sessionManager?.getSessionId?.() || "";
-		currentSessionFile = (ctx as any).sessionManager?.getSessionFile?.() || "";
-		if (currentSessionFile && fs.existsSync(currentSessionFile)) currentSessionFile = fs.realpathSync(currentSessionFile);
 		if (!CURRENT_WORKER_TASK_ID && currentSessionFile && currentSessionId) {
-			upgradeController?.close();
-			upgradeController = createUpgradeController(ctx);
-			try { await upgradeController.recover(); }
-			catch (e) { console.warn("[subagent] recovery failed:", e); }
+			try {
+				const previous = upgradeController;
+				upgradeController = null;
+				previous?.close();
+				upgradeController = createUpgradeController(ctx);
+				await upgradeController.recover();
+			} catch (e) {
+				// Fail closed: never replace/steal worker or controller ownership
+				// to make registration succeed. Runtime identity needs no lease.
+				diagLog(`recovery ERR ${String(e)}`);
+				console.warn("[subagent] recovery failed:", e);
+			}
 		}
 		// Completion callbacks from a pre-/reload or pre-/new extension instance
 		// survive with asyncTasks. Route them through the newest session API.
@@ -3603,11 +3669,11 @@ export default function (pi: ExtensionAPI) {
 		//    桌面端按 pid/panePid 精确查表归属——无共享可变状态,终端 pi 也有
 		//    条目(R1 多终端 pi 结构性解决)。
 		// 2. @pi_session 窗口选项(共享槽,兜底):仅 tmux 内注册,旧版桌面端兼容。
+		let panePid: number | null = null;
+		let tty = "";
 		try {
 			const sessFile = currentSessionFile;
 			let win = "";
-			let panePid: number | null = null;
-			let tty = "";
 			// 用本进程 tty 定位自己的 pane:`rmux display-message` 不带 -t 时在
 			// rmux CLI 上下文里返回的是 daemon 的 current window——新建窗口用
 			// -d(不切过去),竞态下它会落到“上次活跃窗口”,把 @pi_session 写进
@@ -3639,28 +3705,12 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
-			// pid 注册表:终端 pi 也写(无 panePid),桌面端靠它直连会话身份
-			if (sessFile) {
-				const rtDir = path.join(getAgentDir(), "runtime");
-				try { fs.mkdirSync(rtDir, { recursive: true }); } catch {}
-				try {
-					fs.writeFileSync(path.join(rtDir, `${process.pid}.jsonl`), JSON.stringify({
-						type: "pi_runtime",
-						pid: process.pid,
-						panePid,
-						sessionPath: sessFile,
-						cwd: ctx.cwd || "",
-						startedAt: Date.now(),
-						tty,
-					}) + "\n", { encoding: "utf-8", mode: 0o600 });
-				} catch (e: any) {
-					diagLog(`runtime reg ERR ${String(e).slice(0, 120)}`);
-				}
-			}
-			g.__pi_subagent_sfile__ = sessFile;
 		} catch (e: any) {
-			try { fs.appendFileSync(path.join(getAgentLogDir(), "extension-diag.log"), `[${new Date().toISOString()}] pid=${process.pid} reg ERR ${String(e).slice(0, 150)}\n`); } catch {}
+			diagLog(`reg ERR ${String(e)}`);
 		}
+		// Same writer/identity source as the early slot; discovery failure never
+		// erases the base identity, and a failed rename leaves it intact.
+		writeRuntimeRegistration(ctx, runtimeStartedAt, { tty, panePid });
 		const discovery = discoverAgents(ctx.cwd, "both");
 		ctx.ui.setStatus("z_agents", ctx.ui.theme.fg("accent", `Agents: ${discovery.agents.length}`));
 		// 4s 周期刷新:让新 pi 也能显示其他进程运行中的子代理(外部任务)
