@@ -41,7 +41,7 @@ pi -e ./pi-subagent-durable
 
 | Tool | What it does |
 |------|--------------|
-| `subagent` | Delegate tasks (single / parallel / chain). Runs async in the background with a persistent pane. |
+| `subagent` | Delegate tasks (single / parallel / chain). Explicit `async: true` runs in the background with a persistent pane; omitted `async` is false. |
 | `subagent_list` | List this main session's task tree by default: taskId / agent / sessionId / context usage / task summary. Main-only `scope: "machine"` explicitly lists across sessions; worker callers remain descendant-only. |
 | `subagent_reload` | **Kill + reconnect** a running subagent from its saved conversation history (resumed from its saved session, picks up freshly loaded tools/extensions/MCP). Also resumes paused/finished sessions directly. Match by `taskId` / `agent` / `sessionId`; none given = all. |
 | `subagent_stop` | Kill a task and its descendants without resuming; no selector triggers the fast machine-wide emergency stop. |
@@ -104,7 +104,7 @@ Safe defaults prevent a worker-decomposition loop from becoming a process storm:
 - **At most 15 active durable workers machine-wide.** Admission is serialized through the worker-registry lock, so concurrent Pi sessions cannot race past the limit.
 - **Parallel requests are capped at 15 entries and chains at 8 before either sync or async dispatch.** Omitted `async` means `false`.
 - **Recursive stop is the default for main-session management.** `subagent_stop { taskId: ... }` includes descendants. Main sessions may use selector-free `subagent_stop` or `/agent:stop-all` for a machine-wide emergency stop. Worker callers may manage descendants only; self/ancestor/sibling targets and selector-free stop/reload are refused.
-- Only rmux panes with `pane_dead=0` count as running. Legacy monitors remove completed panes automatically; fenced recovery leaves retained dead panes for `/agent:gc`, which never touches live workers.
+- Only rmux panes with `pane_dead=0` count as running. Fenced recovery removes its exact all-dead window after fsync-persisting the outbox. Failed cleanup remains `cleanup_pending`, including after delivery ACK, and is retried by recovery. GC uses the same exact all-dead verification; it never deletes a mixed live/dead window.
 - Every task immediately records parent task/session/path/depth, and new child session headers receive standard `parentSession` lineage for `/resume` and session viewers.
 - Discovery reads only bounded log prefixes, so emergency management does not load multi-gigabyte task logs into memory.
 
@@ -158,19 +158,25 @@ pi (main session)
        └─ no rmux → plain spawn (same filtering/mirroring, no persistent pane)
 ```
 
-- **Kill / resume**: `subagent_reload` kills the pane (or proc), finds the session id from the log's first `session` event, and re-launches with `pi --session <id>` — saved conversation history restored, fresh process picks up new tools/extensions/MCP. Spawned processes receive `PI_SUBAGENT_DEPTH` and the configured hard limits.
-- **Completion detection** polls pane state (`returnCode` / `(dead)`); no fixed timeout, long tasks are never killed prematurely.
+- **Kill / resume**: `subagent_reload` kills the pane (or proc), finds the session id from the log's first `session` event, and re-launches with `pi --session <canonical-file>` — saved conversation history restored, fresh process picks up new tools/extensions/MCP. Spawned processes receive `PI_SUBAGENT_DEPTH` and the configured hard limits.
+- **Completion detection** observes verified pane death and parses current-run lifecycle events and worker status. Query failure is unknown, not completion; individual commands are bounded, but there is no fixed worker-task timeout.
 - **Task ledger** lives on `globalThis` so `/reload` does not lose track of running tasks.
+
+## Completion and resource contract
+
+See [README completion/cleanup](../README.md#completion-cleanup-and-runtime-resources) for current-run version policy, worker exit markers, independent ACK/cleanup, owned command cancellation and reload transfer. `@pi_session` is paired with an owner token; shutdown clears only the matching stable window/path/token. Main machine-list is inspection only: targeted durable stop/reload still require original-parent controller authority. Successful targeted stop retires registry, task entry, monitor, managed ID and discovery cache; failed kill does not retire them. Broad `pkill -f taskId` is no longer a targeted-stop fallback.
+
+Run `python3 scripts/run-isolated-tests.py` rather than running checks against live state. It copies source/tests, blocks live CLIs and keeps private agent/notify directories. Natural-exit tests use the installed Pi print-mode method with a mock provider/session and real disposable child groups, including inherited pipes and controller cancellation; they do not connect to a daemon or platform.
 
 ## Notes
 
-- Subagents inherit the project's `.mcp.json` config when present (`--mcp-config`), so a shared MCP server works out of the box.
+- Subagents start in the recorded cwd without adapter-specific CLI flags. Adapter/native MCP discovery remains the installed client's responsibility; native Pi reads trusted `.pi/mcp.json`, not adapter socket-only `.mcp.json`. No settings/config migration is performed.
 - This package replaces pi's built-in `subagent` tool with the durable version.
-- Avoid `/reload` while subagents are mid-flight (old task closures keep running on the old module instance); prefer `subagent_reload` to hot-update a running agent.
+- Parent `/reload` transfers legacy monitors and rebuilds fenced recovery monitors without restarting workers, but cannot retroactively own older untracked SDK resources. Prefer the prepared cold-parent upgrade for that boundary; use `subagent_reload` only when deliberately restarting a worker to load its runtime changes.
 
 ## Recent fixes
 
-- **Worker self-stop after reload fenced** — a resumed worker could call `subagent_list`, see its own task, misclassify it as a conflicting sibling, then call `subagent_stop` on itself. The process died mid-tool and produced the misleading “completed with no text” notification. Worker callers now see manageable descendants only; stop/reload reject self, ancestor, sibling, arbitrary finished sessions and selector-free global actions; `killTask` has a final self-kill fence. Completion parsing also treats a process exit before `agent_end/agent_settled` as an interruption rather than successful empty output.
+- **Worker self-stop after reload fenced** — a resumed worker could call `subagent_list`, see its own task, misclassify it as a conflicting sibling, then call `subagent_stop` on itself. The process died mid-tool and produced the misleading “completed with no text” notification. Worker callers now see manageable descendants only; stop/reload reject self, ancestor, sibling, arbitrary finished sessions and selector-free global actions; `killTask` has a final self-kill fence. Completion parsing also treats a process exit before current-run settlement as an interruption rather than successful empty output.
 - **Resume a settled session by canonical file path** — completed-session resume resolves and passes the verified non-mirror session file instead of an ambiguous bare session id, preventing continuation data from being split into a mirror.
 - **Recursive subagent process-storm guard** — nesting is limited to one managed generation by default, active workers have an atomic machine-wide cap, sync/async batch limits share the same preflight validation, omitted `async` no longer accidentally means `true`, targeted stop walks descendants, and `/agent:stop-all` provides a constant-time rmux emergency brake.
 - **Orphan/dead-pane management** — external discovery now checks `pane_dead` instead of treating every retained rmux window as running; completion removes its window, `/agent:gc` safely removes historical dead panes, and task/session lineage is persisted at dispatch time.
@@ -181,4 +187,4 @@ pi (main session)
 
 ## Development
 
-Internal/technical documentation (architecture, log format, filter details, known issues & fix history, publishing roadmap) is kept **out of the public repository** — see the `docs/` directory in a local checkout (gitignored, not published).
+This reference and `docs/walkthrough.md` are public. Other local technical documents under `docs/` and private diagnostics under `artifacts/` are gitignored and not published.

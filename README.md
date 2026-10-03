@@ -122,6 +122,22 @@ Older `--parent-pid` calls remain accepted only as assertions against the indepe
 
 Controller heartbeats run independently of RMUX probes. If this controller's authenticated lease expires without a takeover, it atomically acquires a **new fenced epoch**, never revives the expired epoch. A different holder/generation is quarantined locally until explicit reconciliation; worker processes and disk state are retained. Slow probes have bounded waits and one pending slot per task. Background errors are recorded once with a persistent status, not repeatedly printed over the TUI. After loading this fix, `/reload` in an idle main replaces the old recovery timer without restarting workers; do not delete leases or restart all subagents to stop a console-error loop.
 
+### Completion, cleanup and runtime resources
+
+For new fenced recovery tasks, a verified dead RMUX window is removed **after the result outbox is fsync-persisted**, independently of transcript acknowledgment. Cleanup requires the exact task target, stable window/pane IDs, a second all-pane snapshot, and daemon-side dead-pane conditions. Mixed live/dead windows, renamed/replaced targets and query failures are never unconditional kill candidates. A failure remains `cleanup_pending`; even a record with `deliveredAt` is recovered until cleanup succeeds. Ownership retirement is separately persisted as `retirement_pending` and retried after ACK without replaying an acknowledged result. Successful targeted stop retires registry, task, monitor and cache state; failed kill retains them. Canonical sessions, event logs, result entries and the outbox are retained. Unsupported conditional RMUX commands fail closed rather than falling back to an unsafe kill.
+
+Pi >=0.99 and unknown/custom hosts require **current-run `agent_settled`**. An old settlement cannot finish a later `agent_start`, and `agent_end` is not settlement (including pending retry). A verified pre-0.99 CLI records an explicit `legacy-end` policy for compatibility; it accepts only the latest non-retrying end. Missing events never implicitly select this weaker policy. Worker status is recorded separately from the pipeline filter's exit code.
+
+RMUX command clients are extension-owned, bounded and cancellable; cancellation closes their pipes and terminates only their own child process groups, not the daemon or workers. Synchronous discovery uses a bounded private supervisor and `-N` to avoid starting a daemon. Quit/session replacement dispose monitors and UI/ownership timers. Reload preserves legacy monitors and routes them through the new command scope; recovery monitors are rebuilt under fencing. This cannot retroactively cancel untracked SDK commands/timers created by older code already running in the process. A controlled cold parent restart is the stronger boundary for those resources.
+
+These fixes retain the existing canonical-session, lease and outbox architecture: no official `@earendil-works/pi-durable` dependency or new durable daemon is introduced.
+
+Window attribution is compare-and-clear: shutdown clears only the exact `@pi_session` path plus this process's `@pi_session_owner` token on the recorded stable window ID. A replacement registration, even for the same canonical path, is preserved.
+
+### MCP discovery
+
+Workers start from their recorded cwd **without `--mcp-config`**. An installed adapter discovers its own supported config files; native Pi discovers global `mcp.json` and trusted project `.pi/mcp.json`. The extension does not translate `.mcp.json`, socket-only transports, settings or MCP script APIs. Native migration still requires the user's separate configuration/transport changes; launching a worker does not perform migration.
+
 ### Persistence and delivery boundaries
 
 - `<agent-dir>/agent-upgrades/<parentSessionId>.json` is the ready manifest required by the versioned launcher; a session path alone is not a handoff.
@@ -156,7 +172,7 @@ For deliberate machine-wide inspection from a main session, call `subagent_list`
 { "scope": "machine" }
 ```
 
-Worker callers remain limited to manageable descendants and cannot request machine scope. This is a listing change, not a change to machine-wide stop/reload semantics: selector-free management is still machine-wide for a main caller; use exact task IDs for ordinary management.
+Worker callers remain limited to manageable descendants and cannot request machine scope. Machine inspection is not controller authority: targeted durable stop/reload still require the original parent and a valid fenced controller. Selector-free emergency stop remains machine-wide for a main caller; use exact task IDs for ordinary management.
 
 ### Commands
 
@@ -186,8 +202,10 @@ Directed steering/watcher integration additionally uses `pi-agent-notify`, which
 
 ```bash
 npm ci
-npm run check
+python3 scripts/run-isolated-tests.py
 ```
+
+The isolated runner copies source/tests, isolates HOME and agent/notify state, blocks live Pi/RMUX/tmux and process-name kill CLIs, and uses installed dependencies read-only. It runs all test scripts plus the build without invoking `npm run check` against an active registry. It writes a local summary to `artifacts/diagnostics/pi_mcp_durable_20261004/isolated_fix_test_results.json`; private artifacts are gitignored and are not shipped on GitHub. Natural-exit tests use an installed Pi print-mode host with a mocked session/provider and real disposable child groups. Conditional RMUX cleanup is tested with mock adapters, not certified against a live daemon.
 
 CI runs dispatch, identity, ownership, safety, inheritance, resume and upgrade-recovery regression checks. Recovery tests use temporary directories, isolated processes, and mock host/RMUX adapters: parent exit/recovery, offline completion, queued acknowledgment, competing/foreign controllers, receiver migration, legacy bootstrap and unknown liveness. They do not prove compatibility with every Pi/provider version or reproduce a live RMUX/model session. The upgrade scripts' checks validate the identities/state they inspect, **not compatibility across all Pi versions**. Before relying on a new Pi/RMUX/notify combination, exercise the prepare/exit/resume flow in a disposable project and check task count, canonical paths, receiver liveness, controller acquisition and transcript acknowledgment. Do not repeat real external writes merely to test recovery.
 

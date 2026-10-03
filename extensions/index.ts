@@ -52,55 +52,62 @@ import {
 } from "./safety.mjs";
 import { resolveDispatchConfig } from "./dispatch.mjs";
 import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
-import { RecoveryController, probeRmuxTask, readTaskRecords } from "./recovery-v2.mjs";
+import { RecoveryController, probeRmuxTask, readTaskRecords, parseRecoveryResult, atomicRecoveryWrite, taskRecordPath } from "./recovery-v3.mjs";
 import { prepareUpgrade, publishUpgradeManifest } from "./upgrade-handoff-v2.mjs";
 import { selectListedTasks } from "./list-scope.mjs";
+import { runRmuxSync } from "./rmux-sync-client-v3.mjs";
+import { RmuxCommandScope } from "./rmux-command-v3.mjs";
+import { currentRunSettled, lifecyclePolicy, MonitorScope } from "./lifecycle-v3.mjs";
+import { registerWindowBinding, clearWindowBinding } from "./window-binding-v3.mjs";
+import { workerPipelineCommand } from "./worker-pipeline-v3.mjs";
+import { cleanupDeadWindow } from "./dead-window-v3.mjs";
 import { startReceiverKeeper } from "./receiver-keeper.mjs";
 
 // ── RMUX integration ──
 const RMUX_SESSION_NAME = "pi-agents";
 const CURRENT_WORKER_TASK_ID = process.env.PI_SUBAGENT_TASK_ID || "";
 let rmuxAvailable: boolean | null = null;
-let rmuxClient: any = null; // Rmux instance (lazy)
+let rmuxClient: any = null; // command adapter (lazy), no persistent socket
 
-// @rmux/sdk 位置：优先包内 node_modules，兼容旧全局安装
-function resolveRmuxSdk(): string {
-	const self = typeof __dirname !== "undefined" ? __dirname : process.cwd();
-	const candidates = [
-		path.join(self, "..", "node_modules", "@rmux", "sdk", "dist", "index.js"),
-		path.join(self, "node_modules", "@rmux", "sdk", "dist", "index.js"),
-		"/opt/homebrew/lib/node_modules/@rmux/sdk/dist/index.js",
-		"/usr/local/lib/node_modules/@rmux/sdk/dist/index.js",
-	];
-	for (const c of candidates) {
-		try { if (fs.existsSync(c)) return c; } catch {}
-	}
-	return candidates[0];
-}
-
+// Versioned, extension-owned one-shot CLI clients. getRmux never opens a
+// persistent SDK control socket; cancellation kills only our CLI child group.
+let commandScope = new RmuxCommandScope();
+const monitors: MonitorScope = (globalThis as any).__pi_subagent_monitors_v3__ ||= new MonitorScope();
 function checkRmuxAvailable(): boolean {
-	if (rmuxAvailable !== null) return rmuxAvailable;
-	try {
-		execSync("rmux -V", { stdio: "pipe", timeout: 3000 });
-		rmuxAvailable = true;
-	} catch {
-		rmuxAvailable = false;
-	}
-	return rmuxAvailable;
+ if (rmuxAvailable !== null) return rmuxAvailable;
+ try { rmuxAvailable = runRmuxSync(["-V"]).returnCode === 0; }
+ catch { rmuxAvailable = false; }
+ return rmuxAvailable;
+}
+async function getRmux(options: { signal?: AbortSignal } = {}): Promise<any | null> {
+ if (options.signal?.aborted) throw new Error("RMUX command aborted");
+ if (!checkRmuxAvailable()) return null;
+ // Legacy callback closures route through the newest generation after reload.
+ const scope = () => (globalThis as any).__pi_subagent_rmux_scope_v3__ || commandScope;
+ if (!rmuxClient) rmuxClient = { cmd: (...args: string[]) => scope().run(args) };
+ return options.signal ? { cmd: (...args: string[]) => scope().run(args, options) } : rmuxClient;
+}
+function installedLifecyclePolicy(): string {
+ try {
+  // CLI source and bundle entry points both live below the installed package.
+  let dir = path.dirname(fs.realpathSync(process.argv[1] || ""));
+  for (let i = 0; i < 5; i++, dir = path.dirname(dir)) {
+   const file = path.join(dir, "package.json");
+   if (!fs.existsSync(file)) continue;
+   const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+   if (pkg.name === "@earendil-works/pi-coding-agent") return lifecyclePolicy(pkg.version);
+  }
+ } catch {}
+ return "settled"; // unknown SDK/custom entry points fail closed
 }
 
-async function getRmux(): Promise<any | null> {
-	if (!checkRmuxAvailable()) return null;
-	if (rmuxClient) return rmuxClient;
-	try {
-		const mod = await import(resolveRmuxSdk());
-		rmuxClient = await mod.Rmux.builder().connectOrStart();
-		return rmuxClient;
-	} catch (e) {
-		console.warn("[subagent] RMUX init failed:", e);
-		rmuxAvailable = false;
-		return null;
-	}
+async function clearOwnWindowBinding(scope = commandScope): Promise<void> {
+ const g = globalThis as any, binding = g.__pi_subagent_window_binding_v3__;
+ if (!binding) return;
+ try {
+  if (await clearWindowBinding((...args: string[]) => scope.run(args), binding)) delete g.__pi_subagent_window_binding_v3__;
+  else diagLog("window binding cleanup deferred");
+ } catch (e) { diagLog(`window binding cleanup deferred: ${String(e)}`); }
 }
 
 // Strip ANSI escape codes from terminal output
@@ -147,6 +154,7 @@ function appendTaskMetadata(
 			logPath,
 			JSON.stringify({
 				type: "pi_subagent_task",
+                lifecyclePolicy: installedLifecyclePolicy(),
 				taskId,
 				agent,
 				task,
@@ -173,11 +181,8 @@ interface RmuxTaskPane {
 function listRmuxTaskPanes(): RmuxTaskPane[] {
 	const panes: RmuxTaskPane[] = [];
 	try {
-		const output = String(execFileSync("rmux", [
-			"list-panes", "-a", "-F",
-			"#{session_name}|#{window_name}|#{pane_dead}",
-		], { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }));
-		panes.push(...parseRmuxTaskPanes(output, RMUX_SESSION_NAME));
+		const result = runRmuxSync(["list-panes", "-a", "-F", "#{session_name}|#{window_name}|#{pane_dead}"]);
+        if (result.returnCode === 0) panes.push(...parseRmuxTaskPanes(result.stdout, RMUX_SESSION_NAME));
 	} catch {}
 	return panes;
 }
@@ -209,7 +214,7 @@ function workerLogIsSettled(taskId: string): boolean {
 		finally { fs.closeSync(fd); }
 		const lines = buf.toString("utf8").split(/\r?\n/).filter(Boolean);
 		for (let i = lines.length - 1; i >= 0; i--) {
-			try { return JSON.parse(lines[i])?.type === "agent_settled"; }
+			try { const type = JSON.parse(lines[i])?.type; if (["agent_start", "agent_end", "agent_settled", "auto_retry_start"].includes(type)) return type === "agent_settled"; }
 			catch { /* skip a partial line at the tail boundary */ }
 		}
 	} catch { /* log may not exist yet */ }
@@ -385,14 +390,7 @@ function extractStopReason(raw: string): string | undefined {
 }
 
 function hasTerminalAgentEvent(raw: string): boolean {
-	for (const line of raw.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const type = JSON.parse(line)?.type;
-			if (type === "agent_end" || type === "agent_settled") return true;
-		} catch {}
-	}
-	return false;
+ return currentRunSettled(raw, installedLifecyclePolicy());
 }
 
 function extractErrorMessage(raw: string): string | undefined {
@@ -1007,7 +1005,6 @@ async function runSingleAgent(
 	if (dispatch.model) args.push("--model", dispatch.model);
 	if (dispatch.thinkingLevel) args.push("--thinking", dispatch.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
-	if (fs.existsSync(path.join(cwd ?? defaultCwd, '.mcp.json'))) args.push('--mcp-config', path.join(cwd ?? defaultCwd, '.mcp.json'));
 	appendInheritedContextExtension(args, dispatch.contextWindow);
 
 	let tmpPromptDir: string | null = null;
@@ -1091,7 +1088,7 @@ async function runSingleAgent(
 			}
 		};
 
-		const rmux = await getRmux();
+		const rmux = await getRmux({ signal });
 		let exitCode: number;
 		if (rmux) {
 			// ── RMUX 路径:子代理跑在 pi-agents pane(可 attach),同步等待完成 ──
@@ -1111,7 +1108,7 @@ async function runSingleAgent(
 			const childEnv = subagentChildEnv(taskId, dispatch.contextWindow);
 			const childExports = shellEnvAssignments(childEnv, shellQ);
 			const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-				`export ${childExports} && cd ${shellQ(workdir)} && ${piCommand} 2>&1 | ${filterExe} ${filterScript} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${logPath}`);
+				`export ${childExports} && cd ${shellQ(workdir)} && ${workerPipelineCommand(piCommand, `${shellQ(filterExe)} ${shellQ(filterScript)} ${shellQ(logPath)} ${shellQ(sessionPath)} ${shellQ(workdir)} ${shellQ(currentSessionId)} >> ${shellQ(logPath)}`)}`);
 			if (r.returnCode !== 0) {
 				currentResult.stderr = `rmux new-window failed: ${String(r.stderr || r.stdout).slice(0, 300)}`;
 				exitCode = 1;
@@ -1126,21 +1123,27 @@ async function runSingleAgent(
 						let panes: any | null = null;
 						try {
 							panes = await rmux.cmd("list-panes", "-t", rmuxTarget);
-							isDead = panes.returnCode !== 0 || (panes.stdout?.includes("(dead)") ?? false);
-						} catch { isDead = true; }
+							isDead = panes.returnCode === 0 && (panes.stdout?.includes("(dead)") ?? false);
+                        } catch { /* unknown, not completion */ }
 						if (isDead) {
 							clearInterval(timer);
 							if (panes?.returnCode === 0) {
-								try { await rmux.cmd("kill-window", "-t", rmuxTarget.split(".")[0]); } catch {}
+								try { await cleanupDeadWindow((...args: string[]) => rmux.cmd(...args), { taskId, rmuxTarget }); } catch {}
 							}
 							// 读 filter 写入的 agent-log,重建 messages(供 {previous} 传递)
 							try {
 								const raw = fs.readFileSync(logPath, "utf-8");
-								for (const line of raw.split("\n")) processLine(line);
-							} catch {}
-							resolve(0);
+                                for (const line of raw.split("\n")) processLine(line);
+                                const parsed = parseRecoveryResult(raw, taskId, 0, installedLifecyclePolicy());
+                                resolve(parsed.exitCode);
+                                monitors.retire(taskId);
+                            } catch { monitors.retire(taskId); resolve(1); }
 						}
-					}, 2000);
+                    }, 2000);
+                    const cancel = () => { clearInterval(timer); signal?.removeEventListener("abort", cancel); resolve(1); };
+                    monitors.add(taskId, cancel);
+                    signal?.addEventListener("abort", cancel, { once: true });
+                    if (signal?.aborted) cancel();
 				});
 			}
 		} else {
@@ -1179,34 +1182,39 @@ async function runSingleAgent(
 				try {
 					fs.appendFileSync(
 						logPath,
-						JSON.stringify({ type: "agent_end", taskId, exitCode: code ?? 0, timestamp: new Date().toISOString() }) + "\n",
+						JSON.stringify({ type: "pi_subagent_exit", taskId, exitCode: code ?? 1, timestamp: new Date().toISOString() }) + "\n",
 					);
 				} catch {}
-				resolve(code ?? 0);
+                try { resolve(parseRecoveryResult(fs.readFileSync(logPath, "utf8"), taskId, code ?? 1, installedLifecyclePolicy()).exitCode); }
+                catch { resolve(1); }
+                monitors.retire(taskId);
 			});
 
 			proc.on("error", () => {
 				resolve(1);
 			});
 
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+            let escalation: ReturnType<typeof setTimeout> | undefined;
+            const killProc = () => {
+                wasAborted = true;
+                proc.kill("SIGTERM");
+                escalation = setTimeout(() => { if (proc.exitCode === null) proc.kill("SIGKILL"); }, 5000);
+                escalation.unref?.();
+            };
+            monitors.add(taskId, () => {
+                clearTimeout(escalation); signal?.removeEventListener("abort", killProc);
+                proc.unref(); (proc.stdout as any)?.unref?.(); (proc.stderr as any)?.unref?.(); resolve(1);
+            });
+            if (signal?.aborted) killProc();
+            else signal?.addEventListener("abort", killProc, { once: true });
 		});
 		}
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
-	} finally {
+    } finally {
+        monitors.retire(taskId);
 		unregisterWorker(taskId);
 		if (tmpPromptPath)
 			try {
@@ -1302,7 +1310,7 @@ interface AsyncTaskEntry {
 	useRmux: boolean;
 	rmuxTarget?: string;     // session:window.pane
 	rmuxAttachCmd?: string;  // user-facing attach command
-	cwd?: string;            // 任务工作目录（重连时需要 --mcp-config / sessions 定位）
+	cwd?: string;            // 任务工作目录（客户端各自发现 MCP 配置 / sessions 定位）
 	sessionId?: string;      // 子 agent 自己的 pi 会话 id（重连 --session 用）
 	parentSessionId?: string; // 派生它的父 pi 会话 id（任务树/当前会话过滤用）
 	parentTaskId?: string;    // 若父本身是 worker，记录其 task id
@@ -1344,7 +1352,7 @@ function diagLog(msg: string) {
 	} catch {}
 }
 try {
-	diagLog(`loaded; rmux=${checkRmuxAvailable()}`);
+	diagLog("loaded; RMUX discovery deferred to session/tool use");
 } catch {}
 
 // Runtime identity is independent of worker/controller authority. Always read
@@ -1450,6 +1458,12 @@ function getTaskParentSessionId(taskId: string): string | null {
 	return getTaskSessionId(taskId);
 }
 
+function retireTaskMemory(taskId: string): void {
+ monitors.retire(taskId);
+ workerOwnerships().delete(taskId); asyncTasks.delete(taskId);
+ recoveryManagedTaskIds().delete(taskId); _extCache = null;
+}
+
 // 主动 kill 一个运行中的任务（rmux 窗口或 spawn 进程），并标记 intentionalKill
 // 使该任务随后的完成回调只清理、不通知主会话
 // 注意：entry 可能来自本进程 asyncTasks（自己 spawn 的），也可能来自
@@ -1464,54 +1478,45 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
 	const durable = readTaskRecords(path.join(getAgentDir(), "durable-tasks"), entry.parentSessionId).find((r: any) => r.taskId === taskId);
 	if (durable && (durable.parentSessionId !== currentSessionId || !upgradeController)) return false;
 	if (durable) { try { upgradeController!.fence(taskId); } catch { return false; } }
-	entry.intentionalKill = true;
-	try {
-		if (entry.useRmux && entry.rmuxTarget) {
-			const windowTarget = entry.rmuxTarget.split(".")[0]; // session:window
-			// 1) 优先 SDK 客户端；客户端可能已 stale（control-mode 连接断掉会 throw）
-			try {
-				const rmux = await getRmux();
-				if (rmux) {
-					const killed = await rmux.cmd("kill-window", "-t", windowTarget);
-					if (killed.returnCode !== 0) throw new Error("RMUX kill-window failed");
-					upgradeController?.stopTask(taskId);
-					diagLog(`kill ok (sdk) ${taskId} -> ${windowTarget}`);
-					return true;
-				}
-			} catch (e) {
-				diagLog(`kill sdk ERR ${taskId} ${windowTarget}: ${String(e).slice(0, 200)}; fallback cli`);
-				rmuxClient = null;
-				rmuxAvailable = null; // 重置，下次 getRmux 会重新探测/连接
-			}
-			// 2) 兜底：直接走 rmux CLI（绕过 stale 的 SDK 客户端）
-			try {
-				execFileSync("rmux", ["kill-window", "-t", windowTarget], { stdio: "ignore", timeout: 8000 });
-				upgradeController?.stopTask(taskId);
-				diagLog(`kill ok (cli) ${taskId} -> ${windowTarget}`);
-				return true;
-			} catch (e) {
-				diagLog(`kill cli ERR ${taskId} ${windowTarget}: ${String(e).slice(0, 200)}`);
-			}
-		}
-		// 3) 最终兜底：窗口探测/关闭都失败时按 taskId 杀进程树
-		// （父 pi 已死的孤儿，agent-log 路径/子代理 cmdline 都含 taskId）
-		try {
-			execFileSync("pkill", ["-f", taskId], { stdio: "ignore", timeout: 8000 });
-			diagLog(`kill ok (pkill) ${taskId}`);
-			return true;
-		} catch (e) {
-			diagLog(`kill pkill ERR ${taskId}: ${String(e).slice(0, 150)}`);
-		}
-		if (entry.proc) {
-			entry.proc.killed = true;
-			entry.proc.kill();
-			diagLog(`kill ok (proc) ${taskId}`);
-			return true;
-		}
-	} catch (e) {
-		diagLog(`kill ERR ${taskId}: ${String(e).slice(0, 200)}`);
-	}
-	return false;
+    const previousIntent = entry.intentionalKill;
+    const fence = () => { if (durable) upgradeController!.fence(taskId); };
+    const guard = (operation: () => any) => durable ? upgradeController!.guarded(taskId, operation) : operation();
+    let killed = false;
+    try {
+        if (entry.useRmux && entry.rmuxTarget) {
+            const rmux = await getRmux(); if (!rmux) return false;
+            const query = await rmux.cmd("list-panes", "-a", "-F", "#{session_name}:#{window_name}.#{pane_index}|#{window_id}");
+            fence();
+            if (query.returnCode !== 0) return false;
+            const parts = String(query.stdout || "").split("\n").map(line => line.split("|"));
+            const hit = parts.find(row => row[0] === entry.rmuxTarget);
+            if (!hit || !/^\$\d+$/.test(hit[1]) || (durable?.rmuxWindowId && durable.rmuxWindowId !== hit[1])) return false;
+            // Exact task suffix, stable window ID; never broad pkill/task text.
+            if (!entry.rmuxTarget.replace(/\.\d+$/, "").endsWith(taskId)) return false;
+            entry.intentionalKill = true;
+            let operation: Promise<any>;
+            guard(() => { operation = rmux.cmd("kill-window", "-t", hit[1]); });
+            const result = await operation!;
+            fence(); killed = result.returnCode === 0;
+        } else if (entry.proc?.pid && entry.proc.pid !== process.pid) {
+            entry.intentionalKill = true;
+            killed = guard(() => entry.proc.kill("SIGTERM")) === true;
+        }
+        if (!killed) { entry.intentionalKill = previousIntent; return false; }
+        // Cleanup only AFTER confirmed successful kill, under the same fence.
+        guard(() => {
+            const token = durable?.ownershipToken || workerOwnerships().get(taskId);
+            if (token) unregisterWorkerOwnership(getWorkerRegistryPath(), taskId, token);
+        });
+        if (durable) upgradeController!.stopTask(taskId);
+        retireTaskMemory(taskId);
+        diagLog(`kill ok ${taskId}`);
+        return true;
+    } catch (error) {
+        if (!killed) entry.intentionalKill = previousIntent;
+        diagLog(`kill refused/failed ${taskId}: ${String(error)}`);
+        return false;
+    }
 }
 
 function signalFallbackProcesses(taskIds?: Set<string>): number {
@@ -1532,26 +1537,22 @@ function signalFallbackProcesses(taskIds?: Set<string>): number {
 }
 
 async function cleanupDeadRmuxWindows(dryRun = false): Promise<{ found: number; removed: number }> {
-	const deadWindows = [...new Set(
-		listRmuxTaskPanes().filter((pane) => pane.dead).map((pane) => pane.windowName),
-	)];
-	if (dryRun || deadWindows.length === 0) return { found: deadWindows.length, removed: 0 };
-	const results = await mapWithConcurrencyLimit(deadWindows, MAX_CONCURRENCY, async (windowName) => {
-		const target = `${RMUX_SESSION_NAME}:${windowName}`;
-		try {
-			const rmux = await getRmux();
-			if (rmux) {
-				const result = await rmux.cmd("kill-window", "-t", target);
-				if (result.returnCode === 0) return true;
-			}
-		} catch {}
-		try {
-			execFileSync("rmux", ["kill-window", "-t", target], { stdio: "ignore", timeout: 5000 });
-			return true;
-		} catch { return false; }
-	});
-	_extCache = null;
-	return { found: deadWindows.length, removed: results.filter(Boolean).length };
+ const panes = listRmuxTaskPanes();
+ const deadWindows = [...new Set(panes.map(p => p.windowName))].filter(name => panes.filter(p => p.windowName === name).every(p => p.dead));
+ if (dryRun || deadWindows.length === 0) return { found: deadWindows.length, removed: 0 };
+ const results = await mapWithConcurrencyLimit(deadWindows, MAX_CONCURRENCY, async windowName => {
+  const taskId = panes.find(p => p.windowName === windowName)!.taskId;
+  const durable = readTaskRecords(path.join(getAgentDir(), "durable-tasks")).find((r: any) => r.taskId === taskId);
+  try {
+   const rmux = await getRmux(); if (!rmux) return false;
+   const record = durable || { taskId, rmuxTarget: `${RMUX_SESSION_NAME}:${windowName}.0` };
+   const fence = () => { if (durable) { if (durable.parentSessionId !== currentSessionId || !upgradeController) throw new Error("foreign/uncontrolled GC task"); upgradeController.fence(taskId); } };
+   return await cleanupDeadWindow((...args: string[]) => rmux.cmd(...args), record, fence,
+    (op: () => any) => durable ? upgradeController!.guarded(taskId, op) : op());
+  } catch { return false; }
+ });
+ _extCache = null;
+ return { found: deadWindows.length, removed: results.filter(Boolean).length };
 }
 
 async function emergencyStopAll(running: { taskId: string; entry: AsyncTaskEntry }[]): Promise<string> {
@@ -1575,8 +1576,8 @@ async function emergencyStopAll(running: { taskId: string; entry: AsyncTaskEntry
 		} catch { rmuxClient = null; rmuxAvailable = null; }
 		if (!rmuxStopped) {
 			try {
-				execFileSync("rmux", ["kill-session", "-t", RMUX_SESSION_NAME], { stdio: "ignore", timeout: 8000 });
-				rmuxStopped = true;
+				const killed = await commandScope.run(["kill-session", "-t", RMUX_SESSION_NAME]);
+                rmuxStopped = killed.returnCode === 0;
 			} catch { /* session may already be gone */ }
 		}
 	}
@@ -2020,7 +2021,11 @@ export default function (pi: ExtensionAPI) {
 		});
 		return new RecoveryController({ ledgerDir: ledgerDir(), controllerRegistryPath: controllerRegistryPath(),
 			parentSessionId: parentId, parentSessionPath: parentPath,
-			probe: async (record: any) => { const rmux = await getRmux(); return rmux ? probeRmuxTask((...args: string[]) => rmux.cmd(...args), record) : { state: "unknown", reason: "RMUX unavailable" }; },
+			probe: async (record: any, options: { signal?: AbortSignal }) => { const rmux = await getRmux(options); return rmux ? probeRmuxTask((...args: string[]) => rmux.cmd(...args), record) : { state: "unknown", reason: "RMUX unavailable" }; },
+            cleanup: async (record: any, fence: () => void, guard: any) => {
+                const rmux = await getRmux(); if (!rmux) throw new Error("RMUX unavailable for cleanup");
+                return cleanupDeadWindow((...args: string[]) => rmux.cmd(...args), record, fence, guard, () => guard(() => atomicRecoveryWrite(taskRecordPath(ledgerDir(), record.taskId), record)));
+            },
 			isAcknowledged: acknowledged,
 			skipExistingCallback: (record: any) => { const entry = asyncTasks.get(record.taskId); return Boolean(entry && !entry.recoveryManaged); },
 			deliver: async (record: any, fence: () => void, guard: (operation: () => void) => void) => {
@@ -2055,7 +2060,7 @@ export default function (pi: ExtensionAPI) {
 			onCompleted: async (record: any, fence: () => void, guard: (operation: () => void) => void) => {
 				fence();
 				if (record.ownershipToken) guard(() => unregisterWorkerOwnership(getWorkerRegistryPath(), record.taskId, record.ownershipToken));
-				workerOwnerships().delete(record.taskId); asyncTasks.delete(record.taskId);
+                retireTaskMemory(record.taskId);
 				renderSubagentWidget(ctx.ui);
 			},
 			onError: (error: any, record?: any) => {
@@ -2814,7 +2819,6 @@ export default function (pi: ExtensionAPI) {
 		if (dispatch.model) piArgs.push("--model", dispatch.model);
 		if (dispatch.thinkingLevel) piArgs.push("--thinking", dispatch.thinkingLevel);
 		if (agent.tools && agent.tools.length > 0) piArgs.push("--tools", agent.tools.join(","));
-		if (fs.existsSync(path.join(cwd, '.mcp.json'))) piArgs.push('--mcp-config', path.join(cwd, '.mcp.json'));
 		appendInheritedContextExtension(piArgs, dispatch.contextWindow);
 		let tmpPromptPath: string | null = null;
 		if (!resumeSessionId && agent.systemPrompt.trim()) {
@@ -2863,9 +2867,17 @@ export default function (pi: ExtensionAPI) {
 				const childEnv = subagentChildEnv(taskId, dispatch.contextWindow);
 				const childExports = shellEnvAssignments(childEnv, shellQuote);
 				const r = await rmux.cmd("new-window", "-d", "-t", RMUX_SESSION_NAME, "-n", winName,
-					`export ${childExports} && cd ${shellQuote(cwd)} && ${piCommand} 2>&1 | ${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`);
+					`export ${childExports} && cd ${shellQuote(cwd)} && ${workerPipelineCommand(piCommand, `${shellQuote(filterExe)} ${shellQuote(filterScript)} ${shellQuote(logPath)} ${shellQuote(sessionPath)} ${shellQuote(cwd)} ${shellQuote(currentSessionId)} >> ${shellQuote(logPath)}`)}`);
 
-				if (r.returnCode === 0) {
+                if (r.returnCode === 0) {
+                    // Capture the identity of the window we just launched.
+                    // Never infer a replaced window's identity during cleanup.
+                    let launchedWindowId: string | undefined;
+                    try {
+                        const identity = await rmux.cmd("display-message", "-p", "-t", rmuxTarget, "#{window_id}");
+                        const id = String(identity.stdout || "").trim();
+                        if (identity.returnCode === 0 && /^\$\d+$/.test(id)) launchedWindowId = id;
+                    } catch { /* Keep worker running; cleanup will fail closed. */ }
 					fs.appendFileSync(logPath, JSON.stringify({ type: "pi_subagent_launch", mode: "async-rmux", rmuxTarget }) + "\n");
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
 					const dummyProc = { killed: false, exitCode: null, kill: () => {} } as any;
@@ -2879,7 +2891,7 @@ export default function (pi: ExtensionAPI) {
 
 					const cleanup = () => {
 						unregisterWorker(taskId);
-						asyncTasks.delete(taskId);
+                        retireTaskMemory(taskId);
 						if (tmpPromptPath) { try { fs.unlinkSync(tmpPromptPath); } catch {} }
 					};
 
@@ -2892,11 +2904,11 @@ export default function (pi: ExtensionAPI) {
 						if (recoveryManagedTaskIds().has(taskId)) { clearInterval(pollInterval); return; }
 						try {
 							const panes = await rmux.cmd("list-panes", "-t", rmuxTarget);
-							const isDead = panes.returnCode !== 0 || (panes.stdout?.includes("(dead)") ?? false);
+							const isDead = panes.returnCode === 0 && (panes.stdout?.includes("(dead)") ?? false);
 							if (isDead) {
 								clearInterval(pollInterval);
 								if (panes.returnCode === 0) {
-									try { await rmux.cmd("kill-window", "-t", rmuxTarget.split(".")[0]); } catch {}
+									try { await cleanupDeadWindow((...args: string[]) => rmux.cmd(...args), { taskId, rmuxTarget }); } catch {}
 								}
 								handleCompletion();
 								return;
@@ -2905,12 +2917,11 @@ export default function (pi: ExtensionAPI) {
 							const self = asyncTasks.get(taskId);
 							if (self) accumulateTaskUsage(taskId, self);
 							updateWidget();
-						} catch {
-							clearInterval(pollInterval);
-							handleCompletion();
-						}
+                        } catch { /* failed query is unknown; keep monitoring */ }
 					}, 2000);
 
+                    pollInterval.unref?.();
+                    monitors.add(taskId, () => clearInterval(pollInterval));
 					const handleCompletion = () => {
 							if (recoveryManagedTaskIds().has(taskId)) return;
 						// 主 agent 主动 kill（reload/stop）：只清理，不解析结果、不通知主会话
@@ -2927,7 +2938,7 @@ export default function (pi: ExtensionAPI) {
 						const finalText = extractAssistantFinalText(rawOutput);
 						const stopReason = extractStopReason(rawOutput);
 						const errorMessage = extractErrorMessage(rawOutput);
-						const interruptedWithoutTerminal = !hasTerminalAgentEvent(rawOutput);
+						const interruptedWithoutTerminal = !hasTerminalAgentEvent(rawOutput) || stopReason === "error" || stopReason === "aborted";
 
 						cleanup();
 						updateWidget();
@@ -2966,6 +2977,8 @@ export default function (pi: ExtensionAPI) {
 						try {
 							upgradeController.track({ taskId, parentSessionId: currentSessionId, parentSessionPath: currentSessionFile,
 								agent: agentName, task: taskText, cwd, mode: "async-rmux", rmuxTarget, logPath,
+                                rmuxWindowId: launchedWindowId, requireRmuxIdentity: true,
+                                lifecyclePolicy: installedLifecyclePolicy(),
 								startTime: entry.startTime, ownershipToken: reservation?.ownerToken, itemKeys: reservation?.itemKeys });
 							recoveryManagedTaskIds().add(taskId); entry.recoveryManaged = true;
 						} catch (e) { console.warn("[subagent] task ledger failed; upgrade prepare required:", e); }
@@ -3000,12 +3013,11 @@ export default function (pi: ExtensionAPI) {
 		let rawStdout = "";
 		let stderr = "";
 		let pendingLine = "";
-		proc.stdout.on("data", (d: Buffer) => { rawStdout += d.toString(); });
 		proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
 
 		const cleanupFallback = () => {
 			unregisterWorker(taskId);
-			asyncTasks.delete(taskId);
+            retireTaskMemory(taskId);
 			if (tmpPromptPath) { try { fs.unlinkSync(tmpPromptPath); } catch {} }
 		};
 
@@ -3050,7 +3062,7 @@ export default function (pi: ExtensionAPI) {
 			const finalText = extractAssistantFinalText(rawStdout);
 			const stopReason = extractStopReason(rawStdout);
 			const errorMessage = extractErrorMessage(rawStdout);
-			const interruptedWithoutTerminal = !hasTerminalAgentEvent(rawStdout);
+			const interruptedWithoutTerminal = !hasTerminalAgentEvent(rawStdout) || stopReason === "error" || stopReason === "aborted";
 			cleanupFallback();
 			updateWidget();
 			try {
@@ -3103,7 +3115,13 @@ export default function (pi: ExtensionAPI) {
 			if (proc.exitCode !== null || proc.killed) cleanupFallback();
 			else console.warn(`[subagent] task ${taskId} still active after 60s; retaining it`);
 		}, 60000);
-		(orphanCleanup as any).unref?.();
+        interval.unref?.();
+        (orphanCleanup as any).unref?.();
+        monitors.add(taskId, () => {
+            clearInterval(interval); clearTimeout(orphanCleanup);
+            // Detach only: do not terminate a live fallback worker on shutdown.
+            proc.unref(); (proc.stdout as any)?.unref?.(); (proc.stderr as any)?.unref?.();
+        });
 
 		return taskId;
 	};
@@ -3125,7 +3143,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionId = getTaskSessionId(taskId);
 		if (!sessionId) return `- ${taskId} (${entry.agent}): task session not in agent-logs yet, retry later`;
 		if (!(await killTask(taskId))) return `- ${taskId} (${entry.agent}): kill failed, session not resumed to avoid double-running`;
-		if (entry.recoveryManaged) { unregisterWorker(taskId); asyncTasks.delete(taskId); }
+		// killTask already retires recovery-managed state symmetrically.
 		// resume 用**真实会话文件路径**而非 id:pi --session <id> 会把 id 解析到
 		// subagent-task-* 镜像(头 id 相同),导致 getSessionFile 返回镜像、
 		// 注册表/@pi_session 指向镜像 —— desktop 去重后真实会话拿不到
@@ -3223,7 +3241,9 @@ export default function (pi: ExtensionAPI) {
 				this.container.addChild(this.footerText);
 				this.refresh();
 				this.refreshTimer = setInterval(() => this.refresh(), 2000);
-				this.container.dispose = () => clearInterval(this.refreshTimer);
+                const monitorKey = `view:${crypto.randomUUID()}`;
+                monitors.add(monitorKey, () => clearInterval(this.refreshTimer));
+                this.container.dispose = () => monitors.retire(monitorKey);
 			}
 
 			private runningTasks() {
@@ -3587,25 +3607,32 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ── session_start: footer + UI 引用 + 周期刷新子代理 widget ──
-	// 单引号转义(rmux 选项值)
-	const sq = (x: string) => `'${x.replace(/'/g, "'\\''")}'`;
 	// /reload keeps the same SDK session and Pi PID: retain its runtime slot
 	// across extension teardown. Quit/session replacement must discard it.
-	pi.on("session_shutdown", (event) => {
-		try { upgradeController?.close(); }
-		catch (error) { diagLog(`controller close ERR ${String(error)}`); console.warn("[subagent] controller close failed:", error); }
-		finally {
-			upgradeController = null;
-			if (event?.reason !== "reload") {
-				try { fs.unlinkSync(path.join(getAgentDir(), "runtime", `${process.pid}.jsonl`)); }
-				catch (error: any) {
-					if (error.code !== "ENOENT") { diagLog(`runtime unregister ERR ${String(error)}`); console.warn("[subagent] runtime unregister failed:", error); }
-				}
-			}
-		}
-	});
+    pi.on("session_shutdown", async (event) => {
+        // Close controller and cancel owned clients BEFORE awaiting any cleanup.
+        // Otherwise it could publish results into a disposed context while a
+        // window-option query is stalled.
+        try { upgradeController?.close(); }
+        catch (error) { diagLog(`controller close ERR ${String(error)}`); }
+        finally { upgradeController = null; }
+        commandScope.close(); rmuxClient = null;
+        if (event?.reason === "reload") return; // transfer global legacy monitors
+        for (const error of monitors.close()) diagLog(`monitor close ERR ${String(error)}`);
+        const g = globalThis as any;
+        clearInterval(g.__pi_subagent_worker_heartbeat_timer__); g.__pi_subagent_worker_heartbeat_timer__ = null;
+        clearInterval(g.__pi_subagent_widget_timer__); g.__pi_subagent_widget_timer__ = null;
+        g.__pi_subagent_widget_tick__ = null; g.__pi_subagent_ui__ = null; sessionUI = null;
+        try { fs.unlinkSync(path.join(getAgentDir(), "runtime", `${process.pid}.jsonl`)); }
+        catch (error: any) { if (error.code !== "ENOENT") diagLog(`runtime unregister ERR ${String(error)}`); }
+        const cleanupScope = new RmuxCommandScope({ timeoutMs: 3000 });
+        try { await clearOwnWindowBinding(cleanupScope); }
+        finally { cleanupScope.close(); }
+    });
 
-	pi.on("session_start", async (event, ctx) => {
+    pi.on("session_start", async (event, ctx) => {
+        if (commandScope.closed) commandScope = new RmuxCommandScope();
+        (globalThis as any).__pi_subagent_rmux_scope_v3__ = commandScope;
 		const identity = activeSessionIdentity(ctx);
 		currentSessionId = identity.sessionId;
 		currentSessionFile = identity.sessionPath;
@@ -3695,7 +3722,11 @@ export default function (pi: ExtensionAPI) {
 			for (let i = 0; i < 3; i++) {
 				try {
 					tty = execSync(`ps -o tty= -p ${process.pid}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
-					const panes = execSync("rmux list-panes -a -F '#{pane_tty}|#{session_name}:#{window_name}|#{pane_pid}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).toString();
+					const rmux = await getRmux();
+                    if (!rmux) break;
+                    const query = await rmux.cmd("list-panes", "-a", "-F", "#{pane_tty}|#{session_name}:#{window_name}|#{pane_pid}");
+                    if (query.returnCode !== 0) throw new Error("RMUX pane binding discovery failed");
+                    const panes = query.stdout;
 					const hit = panes.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => l.split("|")[0].replace(/^\/dev\//, "") === tty);
 					if (hit) {
 						const parts = hit.split("|");
@@ -3703,9 +3734,13 @@ export default function (pi: ExtensionAPI) {
 						panePid = parseInt(parts[2], 10) || null;
 					}
 					if (win && sessFile) {
-						execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sessFile)}`, {
-							stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
-						});
+                        const binding = await rmux.cmd("display-message", "-p", "-t", win, "#{window_id}");
+                        const windowId = String(binding.stdout || "").trim();
+                        if (binding.returnCode === 0 && /^\$\d+$/.test(windowId)) {
+                            const binding = { windowId, sessionPath: sessFile, ownerToken: crypto.randomUUID() };
+                            await registerWindowBinding((...args: string[]) => rmux.cmd(...args), binding);
+                            (globalThis as any).__pi_subagent_window_binding_v3__ = binding;
+                        }
 					}
 					break;
 				} catch (e: any) {
@@ -3743,12 +3778,7 @@ export default function (pi: ExtensionAPI) {
 		if (g.__pi_subagent_sid__) currentSessionId = g.__pi_subagent_sid__;
 		const sfile = g.__pi_subagent_sfile__ || "";
 		if (sfile) currentSessionFile = sfile;
-		if (sfile) {
-			try {
-				const win = execSync("rmux display-message -p '#{session_name}:#{window_name}'", { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }).toString().trim();
-				if (win) execSync(`rmux set-option -w -t ${sq(win)} @pi_session ${sq(sfile)}`, { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 });
-			} catch {}
-		}
+
 		g.__pi_subagent_widget_tick__ = () => { if (sessionUI) renderSubagentWidget(sessionUI); };
 	}
 	initWidgetState();

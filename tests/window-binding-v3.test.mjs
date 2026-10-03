@@ -1,0 +1,15 @@
+import assert from "node:assert/strict";
+import { registerWindowBinding, clearWindowBinding } from "../extensions/window-binding-v3.mjs";
+const own={windowId:"$9",sessionPath:"/fixture/session.jsonl",ownerToken:"01234567-89ab-cdef-0123-456789abcdef"};
+const calls=[];
+let value=`${own.sessionPath}|${own.ownerToken}`;
+const command=async(...args)=>{calls.push(args);if(args[0]==="display-message")return {returnCode:0,stdout:value};return {returnCode:0};};
+await registerWindowBinding(command,own);assert.deepEqual(calls[0].slice(-3),["$9","@pi_session_owner",own.ownerToken]);
+assert.equal(await clearWindowBinding(command,own),true);assert.match(calls.at(-1).at(-1),/set-option -w -u -t \$9 @pi_session/);
+assert.match(calls.at(-1)[4],new RegExp(own.ownerToken));
+calls.length=0;value="/fixture/other.jsonl|other-token";
+assert.equal(await clearWindowBinding(command,own),true);assert.equal(calls.length,1,"different binding must not be cleared");
+calls.length=0;value=`${own.sessionPath}|new-owner`;
+assert.equal(await clearWindowBinding(command,own),true);assert.equal(calls.length,1,"even same canonical path cannot clear another owner's registration");
+assert.equal(await clearWindowBinding(async()=>({returnCode:1}),own),false);
+console.log("OK: compare-and-clear own stable window/path/token; same-path replacement and foreign bindings preserved");

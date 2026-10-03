@@ -122,6 +122,22 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
 
 Controller 心跳独立于 RMUX 探测执行。若当前 controller 的已认证租约到期、且没有其他 controller 接管，它会原子获取**新的 fencing epoch**，不会复活过期 epoch。发现其他 holder/generation 时只隔离本地自动恢复，等待显式对账，保留 worker 进程及磁盘状态。慢探测有超时上限，同任务仅保留一个在途探测。后台错误只记录一次并显示持久状态，不再反复向 TUI 打印刷屏。加载修复后，在空闲主会话执行 `/reload` 即可替换旧恢复定时器，不重启 worker；不要通过删租约或重启全部 subagent 来压制错误循环。
 
+### 完成、清理与退出资源
+
+新版 recovery 在结果 outbox fsync 持久化后，独立于 transcript ACK 自动删除自己的 dead window。必须核验精确 task target、稳定 window/pane ID、第二次全 pane 快照与 daemon 端 dead 条件；任何 live pane、改名/替换、查询失败均不无条件删除。失败持久化 `cleanup_pending`，即便已有 `deliveredAt` 仍会恢复重试。Ownership 退役另存 `retirement_pending`，ACK 后仍会重试，但不重放已确认结果。定向 stop 只有成功 kill 才清 registry、task、monitor 与 cache；kill 失败保留原状态。Canonical、日志与结果不删除。条件命令不兼容时 fail closed。
+
+Pi >=0.99 与未知/custom host 要求当前 run 的 `agent_settled`；历史 settled 或 `agent_end`（含待 retry）不算成功。经核验的 pre-0.99 CLI 显式记录 `legacy-end` 兼容策略，只接受当前最后一次非重试 end，不从“没见到 settled”自动降级。另记 worker 真实退出码，不误用 filter 的 exit0。
+
+RMUX 命令有真实 signal/timeout、私有进程组取消与 pipe 清理；同步发现由有界私有 supervisor 执行（`-N` 不启动 daemon）。退出/切换会话清自己的 monitor 与 timers；reload 保留 legacy monitor、转交新命令 scope，并 fenced 重建 recovery monitor，不停止 live worker。已运行旧代码的未跟踪 SDK 子进程/timer 不能靠新代码追溯清理，受控父代理冷重启是更强边界。
+
+这些修复保留既有 canonical-session、lease 与 outbox 架构，不引入官方 `@earendil-works/pi-durable` 依赖，也不新增 durable daemon。
+
+`@pi_session` 只按稳定 window ID + 精确 path + 本人的 `@pi_session_owner` token compare-and-clear；不清别人注册，即便其 path 相同。
+
+### MCP 发现
+
+两个 worker 启动路径已移除 `--mcp-config`，按任务 cwd 启动。Adapter 与 native Pi 各自按标准发现配置；native 使用全局 `mcp.json` 与可信项目 `.pi/mcp.json`。插件不转换 `.mcp.json`、socket-only transport、settings 或脚本 API；迁移由用户另行完成，不自动修改配置。
+
 ### 持久化与投递边界
 
 - `<agent-dir>/agent-upgrades/<parentSessionId>.json` 是版本 launcher 必须验证的 ready manifest；仅提供会话路径不等于完成交接。
@@ -156,7 +172,7 @@ Controller 心跳独立于 RMUX 探测执行。若当前 controller 的已认证
 { "scope": "machine" }
 ```
 
-Worker 调用者仍只能查看自己可管理的后代，不能请求机器级 scope。此改动只影响列表，不改变机器级 stop/reload 语义：主代理不带 selector 的管理操作仍是机器级；日常操作请使用精确 task ID。
+Worker 调用者仍只能查看自己可管理的后代，不能请求机器级 scope。机器级检查不等于 controller 权限：定向 durable stop/reload 仍要求原主会话与有效 fenced controller。主代理不带 selector 的紧急 stop 仍是机器级；日常操作请使用精确 task ID。
 
 ### 命令
 
@@ -186,8 +202,10 @@ RMUX 提供持久化终端 pane。普通 spawn 降级路径不能附着到 pane�
 
 ```bash
 npm ci
-npm run check
+python3 scripts/run-isolated-tests.py
 ```
+
+隔离 runner 复制源码/测试，隔离 HOME 与 agent/notify 状态，阻止 live Pi/RMUX/tmux 及按进程名 kill 的 CLI，只读使用已安装依赖，不对活跃注册表直接执行 `npm run check`。结果写入本地 `artifacts/diagnostics/pi_mcp_durable_20261004/isolated_fix_test_results.json`；私有产物已 gitignore，不发布到 GitHub。自然退出测试使用已安装 Pi 的 print-mode host、mock session/provider 与真实的可丢弃子进程组。条件 RMUX 清理使用 mock adapter 验证，未对 live daemon 做端到端认证。
 
 CI 执行 dispatch、identity、ownership、safety、inheritance、resume 和升级恢复回归检查。恢复测试使用临时目录、隔离进程及 mock host/RMUX adapter，覆盖主代理退出/恢复、离线完成、排队后的确认、竞争/其他主会话 controller、receiver 迁移、旧 main bootstrap 和未知存活状态。这些测试不能证明兼容所有 Pi/provider 版本，也不复现真实 RMUX/model 会话。升级脚本的检查只验证其检查到的身份/状态，**不保证跨所有 Pi 版本兼容**。依赖新的 Pi/RMUX/notify 组合之前，应在可丢弃项目中演练准备/退出/恢复，检查任务数、canonical 路径、receiver 存活、controller 获取和 transcript 确认。不要为了测试恢复而重复真实外部写入。
 

@@ -21,12 +21,18 @@ const peers = {
   "node:fs": `export * from 'node:fs';import fs from 'node:fs';export const renameSync=(from,to)=>{globalThis.__fixtureRuntimeRename?.(from,to);return fs.renameSync(from,to)};`,
   "node:child_process": `export const spawn=()=>{throw Error('real spawn forbidden')};export const execSync=(cmd)=>{if(cmd==='rmux -V')return 'fixture';if(cmd.includes('ps -o tty'))return 'fixture-tty';if(cmd.startsWith('rmux'))return '';throw Error('unexpected exec '+cmd)};export const execFileSync=(cmd)=>{if(cmd==='ps')return '';if(cmd==='rmux')return '';throw Error('unexpected exec '+cmd)};`,
 };
-const source = fs.readFileSync("extensions/index.ts", "utf8").replace('const mod = await import(resolveRmuxSdk());', 'const mod = { Rmux: { builder: () => ({ connectOrStart: async () => globalThis.__fixtureRmux }) } };');
+const originalSource = fs.readFileSync("extensions/index.ts", "utf8");
+const source = originalSource.replace(/async function getRmux\([\s\S]*?\n}\nfunction installedLifecyclePolicy/, 'async function getRmux() { return globalThis.__fixtureRmux; }\nfunction installedLifecyclePolicy');
 const file = path.join(root, "extension.mjs");
-let state = "live";
+let state = "live", removed = false, cleanupFail = true;
 const taskId = "task-extension-aaaa", target = `pi-agents:fixture-${taskId}.0`;
 globalThis.__fixtureRmux = { cmd: async (...args) => {
-  assert.equal(args[0], "list-panes", "recovery/prepare must not restart or kill panes");
+  if (args.includes("#{pane_tty}|#{session_name}:#{window_name}|#{pane_pid}")) return {returnCode:0, stdout:""};
+  if (args[0] === "if-shell") { if (cleanupFail) return {returnCode: 1}; removed = true; return {returnCode:0}; }
+  if (args[0] === "kill-window") { if (state === "kill-fail") return {returnCode:1}; removed=true;return {returnCode:0}; }
+  assert.equal(args[0], "list-panes", "recovery must not restart panes");
+  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0, stdout:`${target}|$42`};
+  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}|#{pane_id}|#{pane_dead}")) return {returnCode:0, stdout: removed ? "" : `${target}|$42|%7|${state === "dead" ? 1 : 0}`};
   if (state === "unknown") return { returnCode: 1, stderr: "fixture connection failure" };
   return { returnCode: 0, stdout: args.includes("#{session_name}|#{window_name}|#{pane_dead}")
     ? `pi-agents|fixture-${taskId}|${state === "dead" ? 1 : 0}`
@@ -89,7 +95,7 @@ try {
       async recover(){if(this.firstRecovery){this.firstRecovery=false;globalThis.__fixtureRecoveryStage?.('recover')}return super.recover()}
     }`);
   let bundledSource = replacePeers(source);
-  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : (name === "recovery.mjs" || name === "recovery-v2.mjs") ? mockRecovery : path.resolve("extensions", name)));
+  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : (name === "recovery.mjs" || name === "recovery-v2.mjs" || name === "recovery-v3.mjs") ? mockRecovery : path.resolve("extensions", name)));
   const input = path.join(root, "index.ts"); fs.writeFileSync(input, bundledSource);
   execFileSync("npx", ["--no-install", "esbuild", input, "--bundle", "--platform=node", "--format=esm", `--outfile=${file}`], { stdio: "pipe" });
   const extension = await import(pathToFileURL(file));
@@ -128,8 +134,12 @@ try {
   const leases=JSON.parse(fs.readFileSync(path.join(root,"durable-tasks",".controllers.json"))).leases;
   assert.equal(leases[legacyId].ownerPid,process.pid,"existing callback retains controller authority without another completion monitor");
   // Emulate host teardown + fresh module/factory, with the same SDK session/PID.
+  let monitorDisposed=false;
+  const retainedTimer=setInterval(()=>{},1000);
+  globalThis.__pi_subagent_monitors_v3__.add("fixture-ref-monitor",()=>{clearInterval(retainedTimer);monitorDisposed=true;});
   const beforeReload = fs.readFileSync(runtimeSlot, "utf8");
   await handlers.get("session_shutdown")({type:"session_shutdown",reason:"reload"}, ctx);
+  assert.equal(monitorDisposed,false,"reload transfers legacy monitor without killing workers");
   assert.equal(fs.readFileSync(runtimeSlot, "utf8"), beforeReload, "reload gap retains the exact original slot");
   const reloadExtension = await import(`${pathToFileURL(file)}?reload=1`);
   reloadExtension.default(pi);
@@ -154,6 +164,33 @@ try {
   const unknownList=await listTool.execute("unknown",{},null,null,unknownCtx);
   assert.deepEqual(unknownList.details.taskIds,[],"unknown caller session does not fall back to stale module-global ownership");
   globalThis.__pi_subagent_async_tasks__.delete(foreignId);globalThis.__pi_subagent_async_tasks__.delete(unknownId);
+  // Recovery-managed targeted stop must retire all local state only on success.
+  const stopId="task-stop-aaaa", stopTarget=`pi-agents:fixture-${stopId}.0`;
+  const controller=globalThis.__fixtureControllerOptions;
+  const stopLog=path.join(root,"agent-logs",`${stopId}.jsonl`); fs.writeFileSync(stopLog,'{"type":"agent_start"}\n');
+  registerWorkerOwnership(registryPath,{taskId:stopId,ownerPid:process.pid,ownerToken:"stop-token",cwd:root,itemKeys:[`worker:${stopId}`]});
+  atomicRecoveryWrite(taskRecordPath(path.join(root,"durable-tasks"),stopId),{version:1,taskId:stopId,mode:"async-rmux",parentSessionId:parentId,parentSessionPath:parentPath,agent:"fixture",cwd:root,rmuxTarget:stopTarget,logPath:stopLog,ownershipToken:"stop-token"});
+  const originalRmux=globalThis.__fixtureRmux;
+  globalThis.__fixtureRmux={cmd:async(...args)=>{
+    if(args[0]==="kill-window") return {returnCode:state==="kill-fail"?1:0};
+    if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0,stdout:`${stopTarget}|$90`};
+    const r=await originalRmux.cmd(...args); if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}|#{pane_dead_status}")) r.stdout+=`\n${stopTarget}|0|`; return r;
+  }};
+  state="live"; await commands.get("agent:recover").handler("",ctx);
+  assert.ok(globalThis.__pi_subagent_async_tasks__.has(stopId));
+  state="kill-fail";
+  await tools.get("subagent_stop").execute("stop-fail",{taskId:stopId,recursive:false},null,null,ctx);
+  assert.ok(globalThis.__pi_subagent_async_tasks__.has(stopId));
+  assert.ok(readWorkerOwnershipRegistry(registryPath).workers[stopId]);
+  assert.equal(globalThis.__pi_subagent_async_tasks__.get(stopId).intentionalKill,undefined);
+  state="live"; await tools.get("subagent_stop").execute("stop-ok",{taskId:stopId,recursive:false},null,null,ctx);
+  assert.equal(globalThis.__pi_subagent_async_tasks__.has(stopId),false);
+  assert.equal(globalThis.__pi_subagent_recovery_managed__?.has(stopId)||false,false);
+  assert.equal(readWorkerOwnershipRegistry(registryPath).workers[stopId],undefined);
+  assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===stopId).status,"stopped");
+  const repeat=await tools.get("subagent_stop").execute("stop-again",{taskId:stopId,recursive:false},null,null,ctx);
+  assert.match(JSON.stringify(repeat),/No running|no matched|No matched/i);
+  globalThis.__fixtureRmux=originalRmux;
   state = "unknown"; await commands.get("agent:recover").handler("",ctx); assert.equal(sent.length,0);
   state = "dead"; await commands.get("agent:recover").handler("",ctx); assert.equal(sent.length,1);
   assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId)[0].deliveredAt,undefined,"queued notification is not prematurely acknowledged");
@@ -165,7 +202,13 @@ try {
   assert.equal(sent.length,2,"unacknowledged fire-and-forget delivery retries after 30 seconds while idle");
   while(queued.length) { const content=queued.shift();entries.push({type:"message",message:{role:"user",content}});fs.appendFileSync(parentPath,JSON.stringify(entries.at(-1))+"\n"); }
   await commands.get("agent:recover").handler("",ctx);
-  assert.ok(readTaskRecords(path.join(root,"durable-tasks"),parentId)[0].deliveredAt);
+  const completedRecord = readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===taskId);
+  assert.ok(completedRecord.deliveredAt);
+  assert.equal(completedRecord.cleanupState,"cleanup_pending", "ACK must not forget failed cleanup");
+  assert.equal(globalThis.__pi_subagent_async_tasks__.has(taskId),false);
+  cleanupFail=false; await commands.get("agent:recover").handler("",ctx);
+  assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===taskId).cleanupState,"cleaned");
+  assert.equal(removed,true); assert.ok(fs.existsSync(logPath)); assert.ok(fs.existsSync(parentPath));
   assert.ok(entries.some(e=>e.customType==="agent-delivery"));
   await commands.get("agent-results").handler("",ctx); assert.match(notices.at(-1),/fixture/);
   // prepare refuses before starting the detached keeper or changing reservations.
@@ -175,6 +218,10 @@ try {
   globalThis.__pi_subagent_async_tasks__.delete("task-fallback-bbbb");
   await handlers.get("session_shutdown")({type:"session_shutdown",reason:"new"}, ctx);
   assert.equal(fs.existsSync(runtimeSlot), false, "/new removes the old session slot");
+  assert.equal(monitorDisposed,true,"replacement disposes legacy referenced monitor");
+  assert.equal(globalThis.__pi_subagent_worker_heartbeat_timer__,null);
+  assert.equal(globalThis.__pi_subagent_widget_timer__,null);
+  assert.equal(globalThis.__pi_subagent_widget_tick__,null);
   const otherPath=path.join(root,"other.jsonl");fs.writeFileSync(otherPath,JSON.stringify({type:"session",id:"other"})+"\n");
   const otherCtx = {...ctx,sessionManager:{...ctx.sessionManager,getSessionId:()=>"other",getSessionFile:()=>otherPath}};
   expectedIdentity = {sessionId:"other",sessionPath:otherPath};

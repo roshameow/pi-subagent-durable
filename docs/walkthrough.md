@@ -22,7 +22,8 @@ If the task finishes before you interrupt it, resume the completed session with 
 
 ## Parent upgrade recovery checks
 
-Run `npm run check` for isolated upgrade regression exercises. The new recovery
+Run `python3 scripts/run-isolated-tests.py` from the extension checkout for upgrade
+regression exercises isolated from active user state. The recovery
 fixtures use mock RMUX/host adapters and disposable receiver/controller processes,
 not business workers or a model connection. They verify:
 

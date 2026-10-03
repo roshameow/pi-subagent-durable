@@ -9,6 +9,9 @@ dist/
 *.log
 .DS_Store
 
+# private diagnostics and verification output
+/artifacts/
+
 # pi install artifacts
 .npm/
 /docs/*
