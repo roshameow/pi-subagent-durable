@@ -14,7 +14,7 @@ process.env.PI_SUBAGENT_CONTEXT_WINDOW = "1000000";
 
 try {
   const handlers = new Map();
-  const extension = await import(pathToFileURL("/tmp/pi-subagent-durable-check/context-inherit.js"));
+  const extension = await import(pathToFileURL(path.join(process.env.PI_SUBAGENT_TEST_BUILD_DIR || "/tmp/pi-subagent-durable-check", "context-inherit.js")));
   extension.default({ on(name, handler) { handlers.set(name, handler); } });
 
   const header = { type: "session", id: "child" };

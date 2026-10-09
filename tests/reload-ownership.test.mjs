@@ -52,7 +52,7 @@ try {
   const freshLoaded = await jiti.import(freshFactory);
   assert.equal((typeof freshLoaded === "function" ? freshLoaded : freshLoaded.default)(), true, "versioned factory and dependency edges work through the real JITI loader");
   const source = fs.readFileSync("extensions/index.ts", "utf8");
-  assert.match(source, /from "\.\/ownership-registry-v2\.mjs"/);
+  assert.match(source, /from "\.\/ownership-registry-v3\.mjs"/);
   assert.match(source, /from "\.\/upgrade-handoff-v2\.mjs"/);
   assert.match(fs.readFileSync("extensions/upgrade-handoff-v2.mjs", "utf8"), /from "\.\/ownership-registry-v2\.mjs"/);
   assert.match(fs.readFileSync("scripts/prepare-upgrade.mjs", "utf8"), /from "\.\.\/extensions\/upgrade-handoff-v2\.mjs"/);

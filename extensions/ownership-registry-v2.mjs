@@ -169,6 +169,23 @@ export function registerWorkerOwnership(registryPath, record, options = {}) {
     // reservation or replace its keys, PID, or identity path during /reload.
     if (current?.ownershipMode === "receiver" && record.ownershipMode !== "receiver") return current;
     const receiver = record.ownershipMode === "receiver" ? receiverOwnershipRecord(record) : null;
+    // 2026-10-06: **死掉的 worker 条目不得继续占住 item**。
+    // 实测（211442）：worker 被 stop 后 durable 记录已是 status=stopped、PID 不存在，但 registry 仍留着它的
+    // itemKeys ⇒ 新 worker 领同一题时抛 `worker item collision: 211442 already owned by <dead task>`，
+    // 而那个 task 连 `.receiver-identity.json` 都没有（notify 也送不进去）。这里在判定冲突前先按 PID 清掉死条目。
+    // 注意 receiver 模式：它的 `ownerPid` 是**父进程**，父进程退出是正常设计（所有权要活下来），
+    // 所以 receiver 记录的存活判据是 `workerPid`，不能拿 ownerPid 判死。
+    const livenessPid = (other) => (other?.ownershipMode === "receiver"
+      ? Number(other?.workerPid)
+      : Number(other?.ownerPid ?? other?.pid));
+    const staleTaskIds = Object.entries(data.workers)
+      .filter(([taskId, other]) => {
+        if (taskId === record.taskId) return false;
+        const pid = livenessPid(other);
+        return Number.isFinite(pid) && pid > 0 && !pidAlive(pid);
+      })
+      .map(([taskId]) => taskId);
+    for (const taskId of staleTaskIds) delete data.workers[taskId];
     const otherWorkers = Object.entries(data.workers).filter(([taskId]) => taskId !== record.taskId);
     const activeTaskIds = new Set(otherWorkers.map(([taskId]) => taskId));
     for (const taskId of options.externalActiveTaskIds || []) {

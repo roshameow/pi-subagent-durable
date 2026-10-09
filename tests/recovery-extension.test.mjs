@@ -28,6 +28,7 @@ let state = "live", removed = false, cleanupFail = true;
 const taskId = "task-extension-aaaa", target = `pi-agents:fixture-${taskId}.0`;
 globalThis.__fixtureRmux = { cmd: async (...args) => {
   if (args.includes("#{pane_tty}|#{session_name}:#{window_name}|#{pane_pid}")) return {returnCode:0, stdout:""};
+  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}")) return { returnCode: 0, stdout: `${target}|0` };
   if (args[0] === "if-shell") { if (cleanupFail) return {returnCode: 1}; removed = true; return {returnCode:0}; }
   if (args[0] === "kill-window") { if (state === "kill-fail") return {returnCode:1}; removed=true;return {returnCode:0}; }
   assert.equal(args[0], "list-panes", "recovery must not restart panes");
@@ -94,8 +95,15 @@ try {
       constructor(options){globalThis.__fixtureRecoveryStage?.('constructor');super(options);globalThis.__fixtureControllerOptions=options;this.firstRecovery=true}
       async recover(){if(this.firstRecovery){this.firstRecovery=false;globalThis.__fixtureRecoveryStage?.('recover')}return super.recover()}
     }`);
+  const mockRegistry = path.join(root, "registry-adapter.mjs");
+  fs.writeFileSync(mockRegistry, `export * from ${JSON.stringify(path.resolve("extensions/ownership-registry-v3.mjs"))};
+    import { unregisterWorkerOwnership as realUnregister } from ${JSON.stringify(path.resolve("extensions/ownership-registry-v3.mjs"))};
+    export function unregisterWorkerOwnership(...args) {
+      if (globalThis.__fixtureRegistryFailure === args[1]) throw Error('fixture registry cleanup failure');
+      return realUnregister(...args);
+    }`);
   let bundledSource = replacePeers(source);
-  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : (name === "recovery.mjs" || name === "recovery-v2.mjs" || name === "recovery-v3.mjs") ? mockRecovery : path.resolve("extensions", name)));
+  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : name === "ownership-registry-v3.mjs" ? mockRegistry : (name === "recovery.mjs" || name === "recovery-v2.mjs" || name === "recovery-v3.mjs") ? mockRecovery : path.resolve("extensions", name)));
   const input = path.join(root, "index.ts"); fs.writeFileSync(input, bundledSource);
   execFileSync("npx", ["--no-install", "esbuild", input, "--bundle", "--platform=node", "--format=esm", `--outfile=${file}`], { stdio: "pipe" });
   const extension = await import(pathToFileURL(file));
@@ -111,8 +119,30 @@ try {
   globalThis.__pi_subagent_async_tasks__.set(refusedId,{...legacyEntry,agent:"refused-fixture"});
   globalThis.__pi_subagent_async_tasks__.set(legacyId,legacyEntry);
   atomicRecoveryWrite(taskRecordPath(path.join(root,"durable-tasks"),legacyId),{version:1,taskId:legacyId,mode:"async-rmux",parentSessionId:parentId,parentSessionPath:parentPath,agent:"legacy-fixture",task:"legacy",cwd:root,rmuxTarget:legacyEntry.rmuxTarget,logPath});
+  // Reproduce a pre-472 successful stop whose main PID, local Map and timer
+  // survive hot reload. Its log deliberately has no settled/end event.
+  const ghostId = "task-old-ghost", ghostTarget = `pi-agents:fixture-${ghostId}.0`;
+  const ghostLog = path.join(root, "agent-logs", `${ghostId}.jsonl`);
+  fs.writeFileSync(ghostLog, '{"type":"message_update"}\n');
+  registerWorkerOwnership(registryPath, { taskId: ghostId, ownerPid: process.pid, ownerToken: "ghost-token", cwd: root, itemKeys: [`worker:${ghostId}`] });
+  atomicRecoveryWrite(taskRecordPath(path.join(root, "durable-tasks"), ghostId), { version: 1, taskId: ghostId, status: "stopped", mode: "async-rmux", ownershipToken: "ghost-token", parentSessionId: parentId, parentSessionPath: parentPath, cwd: root, rmuxTarget: ghostTarget, logPath: ghostLog });
+  globalThis.__pi_subagent_async_tasks__.set(ghostId, { ...legacyEntry, rmuxTarget: ghostTarget });
+  globalThis.__pi_subagent_worker_ownerships__.set(ghostId, "ghost-token");
+  globalThis.__pi_subagent_recovery_managed__ = new Set([ghostId]);
+  let ghostMonitorDisposed = false;
+  globalThis.__pi_subagent_monitors_v3__.add(ghostId, () => { ghostMonitorDisposed = true; throw Error("fixture monitor disposal failure"); });
+  const oldOwnershipTimer = setInterval(() => { throw Error('old renewal closure must not survive'); }, 15000);
+  oldOwnershipTimer.unref(); globalThis.__pi_subagent_worker_heartbeat_timer__ = oldOwnershipTimer;
   extension.default(pi);
   await handlers.get("session_start")({type:"session_start",reason:"startup"}, ctx);
+  assert.equal(oldOwnershipTimer._destroyed, true, "session_start replaces old global ownership timer");
+  assert.notEqual(globalThis.__pi_subagent_worker_heartbeat_timer__, oldOwnershipTimer);
+  assert.equal(globalThis.__pi_subagent_async_tasks__.has(ghostId), false);
+  assert.equal(globalThis.__pi_subagent_worker_ownerships__.has(ghostId), false);
+  assert.equal(globalThis.__pi_subagent_recovery_managed__.has(ghostId), false);
+  assert.equal(readWorkerOwnershipRegistry(registryPath).workers[ghostId], undefined);
+  assert.equal(ghostMonitorDisposed, true);
+  assert.equal(readTaskRecords(path.join(root, "durable-tasks"), parentId).find(r => r.taskId === ghostId).status, "stopped");
   assert.deepEqual(recoveryStages, ["constructor", "recover"], "early accurate registration exists before controller construction and recovery");
   assert.equal(runtimeWrites.length, 2, "basic slot and enrichment share the atomic writer");
   assert.equal(runtimeWrites[0].tty, ""); assert.equal(runtimeWrites[1].tty, "fixture-tty");
@@ -171,8 +201,10 @@ try {
   registerWorkerOwnership(registryPath,{taskId:stopId,ownerPid:process.pid,ownerToken:"stop-token",cwd:root,itemKeys:[`worker:${stopId}`]});
   atomicRecoveryWrite(taskRecordPath(path.join(root,"durable-tasks"),stopId),{version:1,taskId:stopId,mode:"async-rmux",parentSessionId:parentId,parentSessionPath:parentPath,agent:"fixture",cwd:root,rmuxTarget:stopTarget,logPath:stopLog,ownershipToken:"stop-token"});
   const originalRmux=globalThis.__fixtureRmux;
+  let stopGone = false;
   globalThis.__fixtureRmux={cmd:async(...args)=>{
-    if(args[0]==="kill-window") return {returnCode:state==="kill-fail"?1:0};
+    if(args[0]==="kill-window") { if (state !== "kill-fail") stopGone = true; return {returnCode:state==="kill-fail"?1:0}; }
+    if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}")) return { returnCode: 0, stdout: stopGone ? "" : `${stopTarget}|0` };
     if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0,stdout:`${stopTarget}|$90`};
     const r=await originalRmux.cmd(...args); if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}|#{pane_dead_status}")) r.stdout+=`\n${stopTarget}|0|`; return r;
   }};
@@ -183,7 +215,16 @@ try {
   assert.ok(globalThis.__pi_subagent_async_tasks__.has(stopId));
   assert.ok(readWorkerOwnershipRegistry(registryPath).workers[stopId]);
   assert.equal(globalThis.__pi_subagent_async_tasks__.get(stopId).intentionalKill,undefined);
-  state="live"; await tools.get("subagent_stop").execute("stop-ok",{taskId:stopId,recursive:false},null,null,ctx);
+  state="live";
+  globalThis.__fixtureRegistryFailure = stopId;
+  const partialStop = await tools.get("subagent_stop").execute("stop-partial",{taskId:stopId,recursive:false},null,null,ctx);
+  assert.match(JSON.stringify(partialStop), /killed/);
+  assert.ok(globalThis.__pi_subagent_async_tasks__.has(stopId), "confirmed stop keeps local authenticated retry obligation if registry removal fails");
+  assert.ok(readWorkerOwnershipRegistry(registryPath).workers[stopId]);
+  assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===stopId).status,"stopped");
+  delete globalThis.__fixtureRegistryFailure;
+  const retriedList = await tools.get("subagent_list").execute("retry-cleanup",{},null,null,ctx);
+  assert.equal(retriedList.details.taskIds.includes(stopId), false, "listing retries terminal reconciliation without another kill");
   assert.equal(globalThis.__pi_subagent_async_tasks__.has(stopId),false);
   assert.equal(globalThis.__pi_subagent_recovery_managed__?.has(stopId)||false,false);
   assert.equal(readWorkerOwnershipRegistry(registryPath).workers[stopId],undefined);

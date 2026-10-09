@@ -105,6 +105,8 @@ node /path/to/pi-subagent-durable/scripts/prepare-upgrade.mjs \
 
 ### Reload 错误处理
 
+主会话 `/reload` 后仍残留的已停止 legacy ghost，会在 session start、ownership 心跳与 `subagent_list` 时保守对账。只检查本进程持有、token/canonical 父会话匹配的终态任务；必须通过新鲜且成功的 RMUX/进程快照确认不存在该任务 pane 或精确 worker title，并且没有新鲜 receiver 或有效通知 wait，才退役该条已认证 legacy reservation 与本地跟踪。缺失、损坏、其他归属或 unknown 证据均保留；不向 main/worker 发信号，不改 controller lease，不删历史、不编造结果。替换本进程旧心跳 timer，防止旧闭包续期已停止任务。成功 stop 后 registry 清理失败会保留 stopped 重试义务；等待 transcript ACK 的完成结果不按 ghost 退役。已认证的 receiver-owned reservation 仍按精确存活 identity 续期；ledger 终态不会保护已死/陈旧 receiver 或 token 不匹配的 legacy row，正常 pruning 保持有效。有界有效 wait 只防止 live receiver 被 settlement 过早清理，不能救回已死/过期 receiver。如果先前 unregister 已删除 row，同样的门禁可在锁内严格确认 `already_absent` 后退役旧本地跟踪，不重写 registry metadata 或其他 row。registry 文件缺失/损坏不等于 row 已删除；出现新 owner row 则保留。这不代表已部署或已通过 live daemon 端到端认证。
+
 Reload 必须保留已有 worker 经验证的 item keys/token。恢复或追加指令可能提到其他事项，不是新的所有权声明；当前实现只刷新原 reservation，不再解析那段提示词重绑事项。单个刷新失败会逐任务报告，不再中断主代理 runtime 登记；不会静默重建缺失或身份不匹配的所有权。
 
 Pi 的 `/reload` 会清理扩展 factory，但 Node 可能保留原生 `.mjs` namespace。新 runtime 使用带版本的 registry/handoff 入口，避开旧 namespace 缺少新增 export 的错误。兼容 shim 无法刷新进程里已加载的 namespace；未来 ABI 变化仍需新模块版本或新进程。计划升级优先使用外部 bootstrap。
@@ -205,7 +207,7 @@ npm ci
 python3 scripts/run-isolated-tests.py
 ```
 
-隔离 runner 复制源码/测试，隔离 HOME 与 agent/notify 状态，阻止 live Pi/RMUX/tmux 及按进程名 kill 的 CLI，只读使用已安装依赖，不对活跃注册表直接执行 `npm run check`。结果写入本地 `artifacts/diagnostics/pi_mcp_durable_20261004/isolated_fix_test_results.json`；私有产物已 gitignore，不发布到 GitHub。自然退出测试使用已安装 Pi 的 print-mode host、mock session/provider 与真实的可丢弃子进程组。条件 RMUX 清理使用 mock adapter 验证，未对 live daemon 做端到端认证。
+隔离 runner 复制源码/测试，隔离 HOME 与 agent/notify 状态，阻止 live Pi/RMUX/tmux 及按进程名 kill 的 CLI，只读使用已安装依赖，在私有副本运行全部测试、build 与完整 `npm run check`，不接触活跃注册表。结果写入本地 `artifacts/diagnostics/durable_ghost_20261007/isolated_fix_test_results.json`；私有产物已 gitignore，不发布到 GitHub。自然退出测试使用已安装 Pi 的 print-mode host、mock session/provider 与真实的可丢弃子进程组。条件 RMUX 清理使用 mock adapter 验证，未对 live daemon 做端到端认证。
 
 CI 执行 dispatch、identity、ownership、safety、inheritance、resume 和升级恢复回归检查。恢复测试使用临时目录、隔离进程及 mock host/RMUX adapter，覆盖主代理退出/恢复、离线完成、排队后的确认、竞争/其他主会话 controller、receiver 迁移、旧 main bootstrap 和未知存活状态。这些测试不能证明兼容所有 Pi/provider 版本，也不复现真实 RMUX/model 会话。升级脚本的检查只验证其检查到的身份/状态，**不保证跨所有 Pi 版本兼容**。依赖新的 Pi/RMUX/notify 组合之前，应在可丢弃项目中演练准备/退出/恢复，检查任务数、canonical 路径、receiver 存活、controller 获取和 transcript 确认。不要为了测试恢复而重复真实外部写入。
 

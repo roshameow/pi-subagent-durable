@@ -39,7 +39,8 @@ import {
 	unregisterWorkerOwnership,
 	readWorkerOwnershipRegistry,
 	refreshWorkerOwnership,
-} from "./ownership-registry-v2.mjs";
+} from "./ownership-registry-v3.mjs";
+import { reconcileLegacyGhosts, replaceOwnershipHeartbeat } from "./ghost-reconcile-v1.mjs";
 import {
 	assertBatchWithinLimit,
 	assertSubagentSpawnAllowed,
@@ -263,6 +264,7 @@ function registerWorker(taskId: string, cwd: string, taskText?: string): void {
 		startedAt: new Date().toISOString(),
 	}, {
 		isSettled: workerLogIsSettled,
+		ledgerDir: path.join(getAgentDir(), "durable-tasks"),
 		maxActiveWorkers: readSubagentSafetyConfig().maxActive,
 		externalActiveTaskIds: discoverLiveTaskIdsFast(),
 	});
@@ -275,7 +277,7 @@ function restoreWorkerRegistration(taskId: string): void {
 		console.warn(`[subagent] reload kept ${taskId} unchanged: no in-memory ownership token; inspect before preparing a handoff`);
 		return;
 	}
-	const restored = refreshWorkerOwnership(getWorkerRegistryPath(), taskId, process.pid, ownerToken, { isSettled: workerLogIsSettled });
+	const restored = refreshWorkerOwnership(getWorkerRegistryPath(), taskId, process.pid, ownerToken, { isSettled: workerLogIsSettled, ledgerDir: path.join(getAgentDir(), "durable-tasks") });
 	if (!restored) console.warn(`[subagent] reload kept ${taskId} unchanged: ownership reservation is missing; explicit recovery is required`);
 }
 
@@ -283,25 +285,48 @@ function unregisterWorker(taskId: string): void {
 	const ownerships = workerOwnerships();
 	const ownerToken = ownerships.get(taskId);
 	try {
-		unregisterWorkerOwnership(getWorkerRegistryPath(), taskId, ownerToken, { isSettled: workerLogIsSettled });
+		unregisterWorkerOwnership(getWorkerRegistryPath(), taskId, ownerToken, { isSettled: workerLogIsSettled, ledgerDir: path.join(getAgentDir(), "durable-tasks") });
 	} finally {
 		ownerships.delete(taskId);
 	}
 }
 
+let ghostReconciliation: Promise<string[]> | null = null;
+async function reconcileLocallyHeldGhosts(parentId = currentSessionId, parentPath = currentSessionFile): Promise<string[]> {
+    if (ghostReconciliation) return ghostReconciliation;
+    const work = reconcileLegacyGhosts({
+        ownerships: workerOwnerships(), tasks: asyncTasks, ownerPid: process.pid,
+        parentSessionId: parentId, parentSessionPath: parentPath,
+        ledgerDir: path.join(getAgentDir(), "durable-tasks"),
+        notifyDir: path.dirname(getWorkerRegistryPath()), registryPath: getWorkerRegistryPath(),
+        isCurrent: () => currentSessionId === parentId && currentSessionFile === parentPath,
+        probeRmux: async () => {
+            const rmux = await getRmux();
+            return rmux ? rmux.cmd("list-panes", "-a", "-F", "#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}") : { returnCode: 1 };
+        },
+        probeProcesses: async () => {
+            try { return { returnCode: 0, stdout: String(execFileSync("ps", ["-axo", "pid=,command="], { stdio: ["ignore", "pipe", "ignore"], timeout: 3000 })) }; }
+            catch { return { returnCode: 1 }; }
+        },
+        retireMemory: retireTaskMemory,
+        onError: (error: any, taskId: string) => diagLog(`ghost reconciliation deferred ${taskId}: ${String(error)}`),
+    });
+    ghostReconciliation = work;
+    try { return await work; } finally { if (ghostReconciliation === work) ghostReconciliation = null; }
+}
 function ensureWorkerOwnershipHeartbeat(): void {
-	const g = globalThis as any;
-	if (g.__pi_subagent_worker_heartbeat_timer__) return;
-	g.__pi_subagent_worker_heartbeat_timer__ = setInterval(() => {
-		const ownerships = workerOwnerships();
-		if (ownerships.size === 0) return;
-		try {
-			heartbeatWorkerOwnerships(getWorkerRegistryPath(), ownerships, { isSettled: workerLogIsSettled });
-		} catch (error) {
-			console.warn("[subagent] worker registry heartbeat failed:", error);
-		}
-	}, 15000);
-	g.__pi_subagent_worker_heartbeat_timer__.unref?.();
+    replaceOwnershipHeartbeat(globalThis as any, async () => {
+        const parentId = currentSessionId, parentPath = currentSessionFile;
+        try {
+            await reconcileLocallyHeldGhosts(parentId, parentPath);
+            if (parentId !== currentSessionId || parentPath !== currentSessionFile) return;
+            const ownerships = workerOwnerships();
+            if (ownerships.size) heartbeatWorkerOwnerships(getWorkerRegistryPath(), ownerships, {
+                // No global pruning/log scans on this locally owned heartbeat.
+                skipPrune: true, ledgerDir: path.join(getAgentDir(), "durable-tasks"),
+            });
+        } catch (error) { diagLog(`worker registry heartbeat deferred: ${String(error)}`); }
+    });
 }
 
 // Keep a small, domain-neutral closeout reminder visible in every task prompt.
@@ -1459,8 +1484,9 @@ function getTaskParentSessionId(taskId: string): string | null {
 }
 
 function retireTaskMemory(taskId: string): void {
- monitors.retire(taskId);
+ try { monitors.retire(taskId); } catch (error) { diagLog(`monitor retirement deferred ${taskId}: ${String(error)}`); }
  workerOwnerships().delete(taskId); asyncTasks.delete(taskId);
+ (globalThis as any).__pi_subagent_legacy_callbacks__?.delete(taskId);
  recoveryManagedTaskIds().delete(taskId); _extCache = null;
 }
 
@@ -1481,7 +1507,7 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
     const previousIntent = entry.intentionalKill;
     const fence = () => { if (durable) upgradeController!.fence(taskId); };
     const guard = (operation: () => any) => durable ? upgradeController!.guarded(taskId, operation) : operation();
-    let killed = false;
+    let killed = false, stoppedPersisted = false;
     try {
         if (entry.useRmux && entry.rmuxTarget) {
             const rmux = await getRmux(); if (!rmux) return false;
@@ -1503,6 +1529,14 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
             killed = guard(() => entry.proc.kill("SIGTERM")) === true;
         }
         if (!killed) { entry.intentionalKill = previousIntent; return false; }
+        // A confirmed kill gets a durable stopped obligation BEFORE registry
+        // cleanup. If that write/cleanup fails, keep local credentials and retry
+        // conservatively through ghost reconciliation; never manufacture a result.
+        if (durable) guard(() => {
+            durable.status = "stopped";
+            atomicRecoveryWrite(taskRecordPath(path.join(getAgentDir(), "durable-tasks"), taskId), durable);
+            stoppedPersisted = true;
+        });
         // Cleanup only AFTER confirmed successful kill, under the same fence.
         guard(() => {
             const token = durable?.ownershipToken || workerOwnerships().get(taskId);
@@ -1515,6 +1549,13 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
     } catch (error) {
         if (!killed) entry.intentionalKill = previousIntent;
         diagLog(`kill refused/failed ${taskId}: ${String(error)}`);
+        if (killed && stoppedPersisted) {
+            // Don't discard the ownership-map/task entry: it is the authenticated
+            // retry obligation, not proof of liveness. Stop result monitoring only.
+            try { upgradeController?.stopTask(taskId); } catch (e) { diagLog(`stop retirement pending ${taskId}: ${String(e)}`); }
+            try { monitors.retire(taskId); } catch (e) { diagLog(`stop monitor retirement pending ${taskId}: ${String(e)}`); }
+            return true;
+        }
         return false;
     }
 }
@@ -3357,6 +3398,8 @@ export default function (pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(["session", "machine"], { description: "Visibility scope. Default: session (this main session's task tree). machine is explicit main-only inspection.", default: "session" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const identity = activeSessionIdentity(ctx);
+			await reconcileLocallyHeldGhosts(identity.sessionId, identity.sessionPath);
 			const discovered = findRunningTasks({}, true);
 			const scope = params.scope ?? "session";
 			const sessionId = ctx.sessionManager?.getSessionId?.() || "";
@@ -3651,6 +3694,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		ensureWorkerOwnershipHeartbeat();
+		await reconcileLocallyHeldGhosts();
 		sessionUI = ctx.ui;
 		if (!CURRENT_WORKER_TASK_ID && currentSessionFile && currentSessionId) {
 			try {
