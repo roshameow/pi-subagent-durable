@@ -4,6 +4,11 @@
 
 ## Unreleased / 未发布
 
+### Changed / 变更
+
+- **Parallel background default:** omitted `async` now dispatches parallel workers in the background and immediately returns task IDs. Explicit `async: false` retains synchronous waiting; single/auto and sequential chains are unchanged. The call site normalizes omission so reloading an older cached safety module still uses the new default.
+  **并行默认后台：** 省略 `async` 不再阻塞主会话，派遣后立即返回 task ID；显式 `async: false` 保留同步等待，single/auto 与顺序 chain 不变。调用处补默认值，兼容 `/reload` 后仍缓存旧 safety 模块的进程。
+
 ### Added / 新增
 
 - **Parent cold-restart recovery:** `/agent:prepare-upgrade` persists exact parent/child canonical-session relationships and a ready handoff manifest; `session_start` and `/agent:recover` reacquire prepared asynchronous RMUX tasks, restore monitoring and collect offline completions without restarting workers. Plain-spawn, synchronous and chain runs are not eligible.

@@ -13,7 +13,7 @@
 
 > **父 session 退出升级，长期 worker 不停机，再回到同一个 canonical session 自动恢复。** 前提是异步 RMUX 任务已成功交接，并满足下文 notify/状态目录要求；不是任意退出都能恢复的保证。
 
-- **持久化任务委派：** 支持单任务、并行和 chain，显式 `async: true` 可后台运行，并保存 Pi 对话会话。
+- **持久化任务委派：** 支持单任务、并行和 chain，单任务/并行默认后台运行，并保存 Pi 对话会话。
 - **实时可见与管理：** 可附着到 RMUX pane；查看 task ID/上下文用量；定向停止、从保存会话恢复或 reload runtime；安全清理已死 pane。
 - **按主 session 隔离列表：** `subagent_list` 默认只显示调用主会话的任务树，而非全机器 worker；只有主代理显式选择机器级 scope 才能跨会话查看。
 - **主代理升级不重启 worker：** 准备交接后，只退出父 session，侧装精确 Pi 版本；符合条件的 RMUX worker 持续运行。已有旧 main 可通过外部 bootstrap 首次迁移。
@@ -158,7 +158,7 @@ RMUX 命令有真实 signal/timeout、私有进程组取消与 pipe 清理；同
 | `subagent_reload` | 重启 worker 并从其保存的会话恢复 |
 | `subagent_gc` | 清理已完成/已死的 RMUX pane |
 
-单任务可省略 `agent`，使用通用 worker；`tasks` 用于并行委派，`chain` 在顺序步骤间传递 `{previous}`。省略 `async` 等于 `false`；后台任务必须显式请求 `async: true`。Agent 定义是带 `name`、`description` frontmatter 的 Markdown；新派发时重新读取定义。没有固定 model 的 agent 会继承主代理当前 provider/model 和 thinking level。
+单任务可省略 `agent`，使用通用 worker；`tasks` 用于并行委派，`chain` 在顺序步骤间传递 `{previous}`。并行任务省略 `async` 时默认后台运行，只有显式 `async: false` 才等待全部 worker 退出。single/auto 仍始终后台运行；`chain` 保持顺序执行且忽略 `async`。Agent 定义是带 `name`、`description` frontmatter 的 Markdown；新派发时重新读取定义。没有固定 model 的 agent 会继承主代理当前 provider/model 和 thinking level。
 
 普通指令变更应使用定向 notify steering。`subagent_reload` 会刻意重启 worker 以加载 runtime 变化，**不属于**不重启 worker 的主代理升级流程。Worker 只能管理自己的后代，不能管理自己、祖先或兄弟任务。
 

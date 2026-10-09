@@ -32,7 +32,8 @@ export function parseRmuxTaskPanes(output, expectedSession = "pi-agents") {
 }
 
 export function shouldRunSubagentsAsync(value) {
-  return value === true;
+  // Background by default: forgetting async must not block the parent.
+  return value !== false;
 }
 
 export function assertBatchWithinLimit(kind, count, max) {

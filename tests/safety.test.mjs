@@ -20,7 +20,7 @@ assert.deepEqual(parseRmuxTaskPanes([
   { taskId: "task-live1-abcd", windowName: "_worker-task-live1-abcd", dead: false },
   { taskId: "task-dead1-efgh", windowName: "_worker-task-dead1-efgh", dead: true },
 ]);
-assert.equal(shouldRunSubagentsAsync(undefined), false);
+assert.equal(shouldRunSubagentsAsync(undefined), true, "omitted async must not block the parent");
 assert.equal(shouldRunSubagentsAsync(false), false);
 assert.equal(shouldRunSubagentsAsync(true), true);
 assert.doesNotThrow(() => assertBatchWithinLimit("parallel", 15, 15));

@@ -1266,8 +1266,8 @@ const SubagentParams = Type.Object({
 		maxItems: MAX_CHAIN_TASKS,
 	})),
 	async: Type.Optional(Type.Boolean({
-		description: "Run all tasks in background; return immediately with taskIds. Notify on completion. Default: false",
-		default: false,
+		description: "Parallel tasks run in background by default and return taskIds. Set async: false explicitly to wait for all workers. Single/auto always run in background; chain remains sequential and ignores this flag. Default: true",
+		default: true,
 	})),
 	taskId: Type.Optional(Type.String({ description: "Check status of a previously submitted async task" })),
 	agentScope: Type.Optional(AgentScopeSchema),
@@ -2130,7 +2130,7 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"Modes:",
 			'- single: { agent: "scout", task: "..." } — named agent, or omit agent for a generic worker',
-			'- parallel: { tasks: [...] } — up to 15 tasks (sync execution uses 4 slots; async is capped at 15 active workers)',
+			'- parallel: { tasks: [...] } — background by default; async: false explicitly waits (up to 15 tasks; sync uses 4 slots)',
 			'- chain: { chain: [...] } — sequential steps, use {previous} for prior output',
 			"Safety: one nested generation is allowed by default; machine-wide active workers are capped at 15.",
 		].join(" "),
@@ -2331,8 +2331,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// ── parallel 模式（async=true 时后台执行；默认同步等待）──
-			if (params.tasks && params.tasks.length > 0 && shouldRunSubagentsAsync(params.async)) {
+			// ── parallel 模式（默认后台；仅显式 async=false 才同步等待）──
+			if (params.tasks && params.tasks.length > 0 && shouldRunSubagentsAsync(params.async ?? true)) {
 				assertSubagentSpawnAllowed();
 				// 先校验所有 agent（与 single 模式一致）：无效 agent 直接报错，
 				// 不要假装提交（之前 runAsyncSingleAgent 返回空串时仍报

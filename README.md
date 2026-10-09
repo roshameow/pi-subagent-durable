@@ -13,7 +13,7 @@ Built for research runs, batch jobs and other work that outlives a single conver
 
 > **Exit and upgrade the parent session, keep long-running workers online, then automatically recover in the same canonical session.** Requires a successful handoff of asynchronous RMUX tasks and the notify/state prerequisites below; this is not an arbitrary-exit guarantee.
 
-- **Durable delegation:** single, parallel and chain tasks, with explicit `async: true` for background work and saved Pi conversation sessions.
+- **Durable delegation:** single, parallel and chain tasks, with background-by-default single/parallel work and saved Pi conversation sessions.
 - **Live visibility and control:** attach to RMUX panes; list task IDs/context usage; target stop, saved-session resume or runtime reload; safely remove dead panes.
 - **Session-isolated task lists:** `subagent_list` defaults to the calling main's task tree, not every worker on the machine; machine-wide inspection is an explicit main-only scope.
 - **No-worker-restart parent upgrades:** prepare the handoff, exit only the parent and side-install an exact Pi version while eligible RMUX workers continue running. An external bootstrap supports an existing old main.
@@ -158,7 +158,7 @@ Workers start from their recorded cwd **without `--mcp-config`**. An installed a
 | `subagent_reload` | Restart a worker from its saved session |
 | `subagent_gc` | Remove completed/dead RMUX panes |
 
-Single calls can omit `agent` to use a generic worker; `tasks` runs parallel delegation and `chain` passes `{previous}` between sequential steps. Omitted `async` means `false`; request `async: true` explicitly for background work. Agent definitions are Markdown with `name` and `description` frontmatter; definitions are reread for new dispatches. An unpinned model inherits the parent's active provider/model and thinking level.
+Single calls can omit `agent` to use a generic worker; `tasks` runs parallel delegation and `chain` passes `{previous}` between sequential steps. Parallel calls default to background execution when `async` is omitted; use explicit `async: false` only to wait for all workers. Single/auto calls remain background-only; `chain` remains sequential and ignores `async`. Agent definitions are Markdown with `name` and `description` frontmatter; definitions are reread for new dispatches. An unpinned model inherits the parent's active provider/model and thinking level.
 
 Use directed notify steering for ordinary instruction changes. `subagent_reload` deliberately restarts a worker to load runtime changes; it is **not** part of the no-worker-restart parent upgrade workflow. Worker callers can manage descendants only, not themselves, ancestors or siblings.
 
