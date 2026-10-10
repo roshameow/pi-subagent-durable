@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
 import { RecoveryController, atomicRecoveryWrite, taskRecordPath, readTaskRecords } from "../extensions/recovery-v4.mjs";
-import { cleanupDeadWindowResult, cleanupDeadWindow } from "../extensions/dead-window-v4.mjs";
+import { cleanupDeadWindowResult, cleanupDeadWindow } from "../extensions/dead-window-v5.mjs";
 import { acquireControllerLease, releaseControllerLease, readControllerLeaseRegistry, CONTROLLER_LEASE_TTL_MS } from "../extensions/controller-lease.mjs";
 
 function fixture(t, extra = {}) {
@@ -26,7 +26,7 @@ function fixture(t, extra = {}) {
   let queries = 0, mutations = 0, rows;
   options.cleanup = async (r, fence, guard) => cleanupDeadWindowResult(async (...args) => {
     if (args[0] !== "list-panes") { mutations++; assert.fail("fixture unexpectedly attempted window mutation"); }
-    queries++; return { returnCode: 0, stdout: rows === undefined ? `${r.rmuxTarget}|$2|%3|1` : rows };
+    queries++; return { returnCode: 0, stdout: rows === undefined ? `${r.rmuxTarget}|@2|%3|1` : rows };
   }, r, fence, guard);
   Object.assign(options, extra);
   const create = (overrides = {}) => { const c = new RecoveryController({...options, ...overrides}); controllers.push(c); return c; };
@@ -77,15 +77,15 @@ function faultRename(t, predicate) {
  test("explicit refusal requires successful exact all-dead snapshot, not missing metadata alone", async () => {
   const r={taskId:"task-fixture-aaaa",rmuxTarget:"pi-agents:worker-task-fixture-aaaa.0",requireRmuxIdentity:true};
   const command = stdout => async () => ({returnCode:0,stdout});
-  const dead=`${r.rmuxTarget}|$2|%3|1`;
+  const dead=`${r.rmuxTarget}|@2|%3|1`;
   assert.equal((await cleanupDeadWindowResult(command(dead),r)).code,"missing_launch_identity");
   assert.equal(await cleanupDeadWindow(command(dead),r),false,"compatibility must not treat object as success");
-  for(const rows of [dead.replace(/1$/,"0"),dead+`\n${r.rmuxTarget.replace(/\.0$/,".1")}|$2|%4|0`,`${r.rmuxTarget.replace(/\.0$/,".1")}|$2|%4|0`])
+  for(const rows of [dead.replace(/1$/,"0"),dead+`\n${r.rmuxTarget.replace(/\.0$/,".1")}|@2|%4|0`,`${r.rmuxTarget.replace(/\.0$/,".1")}|@2|%4|0`])
     assert.equal((await cleanupDeadWindowResult(command(rows),r)).state,"retry");
   assert.equal((await cleanupDeadWindowResult(command(""),r)).state,"cleaned");
   await assert.rejects(cleanupDeadWindowResult(async()=>({returnCode:1}),r),/query failed/);
   await assert.rejects(cleanupDeadWindowResult(command("bad row"),r),/unrecognized/);
-  await assert.rejects(cleanupDeadWindowResult(command(dead+"\n"+dead.replace("$2","$99").replace("%3","%99")),r),/ambiguous/);
+  await assert.rejects(cleanupDeadWindowResult(command(dead+"\n"+dead.replace("@2","@99").replace("%3","%99")),r),/ambiguous/);
   assert.equal(r.rmuxWindowId,undefined);
 });
 
@@ -229,7 +229,7 @@ function faultRename(t, predicate) {
     const old=await import(${JSON.stringify(new URL('../extensions/recovery-v3.mjs',import.meta.url).href)});
     const oldDead=await import(${JSON.stringify(new URL('../extensions/dead-window-v3.mjs',import.meta.url).href)});
     const fresh=await import(${JSON.stringify(new URL('../extensions/recovery-v4.mjs',import.meta.url).href)});
-    const freshDead=await import(${JSON.stringify(new URL('../extensions/dead-window-v4.mjs',import.meta.url).href)});
+    const freshDead=await import(${JSON.stringify(new URL('../extensions/dead-window-v5.mjs',import.meta.url).href)});
     assert.notEqual(old.RecoveryController,fresh.RecoveryController);
     assert.notEqual(oldDead.cleanupDeadWindow,freshDead.cleanupDeadWindow);
     assert.equal(typeof fresh.RecoveryController.prototype.retryCleanup,'function');

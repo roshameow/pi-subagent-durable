@@ -128,7 +128,9 @@ Controller 心跳独立于 RMUX 探测执行。若当前 controller 的已认证
 
 新版 recovery 在结果 outbox fsync 持久化后，独立于 transcript ACK 自动删除自己的 dead window。必须核验精确 task target、稳定 window/pane ID、第二次全 pane 快照与 daemon 端 dead 条件；任何 live pane、改名/替换、查询失败均不无条件删除。失败持久化 `cleanup_pending`，即便已有 `deliveredAt` 仍会恢复重试。Ownership 退役另存 `retirement_pending`，ACK 后仍会重试，但不重放已确认结果。定向 stop 只有成功 kill 才清 registry、task、monitor 与 cache；kill 失败保留原状态。Canonical、日志与结果不删除。条件命令不兼容时 fail closed。
 
-**清理停放（暂不激活）：** 新入口 `recovery-v4.mjs` 与 `dead-window-v4.mjs` 隔离已运行主代理缓存的原生 ESM namespace。仓库实现已通过隔离 fixture 验证；不表示已部署，也不要求现在 reload。
+**清理停放（暂不激活）：** 新入口 `recovery-v4.mjs` 与 `dead-window-v5.mjs` 隔离已运行主代理缓存的原生 ESM namespace。仓库实现已通过隔离 fixture 验证；不表示已部署，也不要求现在 reload。
+
+RMUX 0.9.1 的 **`#{window_id}` 是 `@数字`**，**`#{pane_id}` 是 `%数字`**，**session ID 是 `$数字`**。当前 runtime 的启动捕获、清理、绑定与定向 stop 只接受 `@` window ID，拒绝 `$` session selector，绝不将其传给窗口操作。新路径 `dead-window-v5.mjs`、`window-binding-v4.mjs` 修正此前错误的 `$` window fixture，保留旧模块 ABI/缓存不变。历史缺失 launch ID 仍保持缺失，不从当前 dead 窗口推断或领用身份。激活仍由主代理负责。
 
 - 永久清理结果 `missing_launch_identity` 仅来自权威快照：精确目标的**全部 pane 均已死亡**。查询失败/unknown、混合 live/dead 或目标不明确均不能据此分类；绝不推断缺失的 launch window/pane ID。
 - 对该永久失败，仅 `status: completed`、存在 result、`deliveredAt` 已持久化且 `retirementState: retired` 时，才可持久化 `cleanupState: blocked_manual` 及原因，**随后**释放 maintenance lease。停放保留结果、canonical 会话、日志和 pane，不等于清理成功。冷启动报告 parked 而非 cleaned，不重新获取已释放的 parked lease。

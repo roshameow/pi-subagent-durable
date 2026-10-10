@@ -59,9 +59,9 @@ import { selectListedTasks } from "./list-scope.mjs";
 import { runRmuxSync } from "./rmux-sync-client-v3.mjs";
 import { RmuxCommandScope } from "./rmux-command-v3.mjs";
 import { currentRunSettled, lifecyclePolicy, MonitorScope } from "./lifecycle-v3.mjs";
-import { registerWindowBinding, clearWindowBinding } from "./window-binding-v3.mjs";
+import { registerWindowBinding, clearWindowBinding, isRmuxWindowId } from "./window-binding-v4.mjs";
 import { workerPipelineCommand } from "./worker-pipeline-v3.mjs";
-import { cleanupDeadWindow, cleanupDeadWindowResult } from "./dead-window-v4.mjs";
+import { cleanupDeadWindow, cleanupDeadWindowResult } from "./dead-window-v5.mjs";
 import { startReceiverKeeper } from "./receiver-keeper.mjs";
 
 // ── RMUX integration ──
@@ -1515,8 +1515,9 @@ async function killTask(taskId: string, knownEntry?: AsyncTaskEntry): Promise<bo
             fence();
             if (query.returnCode !== 0) return false;
             const parts = String(query.stdout || "").split("\n").map(line => line.split("|"));
-            const hit = parts.find(row => row[0] === entry.rmuxTarget);
-            if (!hit || !/^\$\d+$/.test(hit[1]) || (durable?.rmuxWindowId && durable.rmuxWindowId !== hit[1])) return false;
+            const hits = parts.filter(row => row[0] === entry.rmuxTarget);
+            const hit = hits.length === 1 ? hits[0] : undefined;
+            if (!hit || hit.length !== 2 || !isRmuxWindowId(hit[1]) || (durable?.rmuxWindowId && durable.rmuxWindowId !== hit[1])) return false;
             // Exact task suffix, stable window ID; never broad pkill/task text.
             if (!entry.rmuxTarget.replace(/\.\d+$/, "").endsWith(taskId)) return false;
             entry.intentionalKill = true;
@@ -2931,7 +2932,7 @@ export default function (pi: ExtensionAPI) {
                     try {
                         const identity = await rmux.cmd("display-message", "-p", "-t", rmuxTarget, "#{window_id}");
                         const id = String(identity.stdout || "").trim();
-                        if (identity.returnCode === 0 && /^\$\d+$/.test(id)) launchedWindowId = id;
+                        if (identity.returnCode === 0 && isRmuxWindowId(id)) launchedWindowId = id;
                     } catch { /* Keep worker running; cleanup will fail closed. */ }
 					fs.appendFileSync(logPath, JSON.stringify({ type: "pi_subagent_launch", mode: "async-rmux", rmuxTarget }) + "\n");
 					// 用 dummy proc 占位（checkRmux 时会替换为真正的进程检查）
@@ -3794,7 +3795,7 @@ export default function (pi: ExtensionAPI) {
 					if (win && sessFile) {
                         const binding = await rmux.cmd("display-message", "-p", "-t", win, "#{window_id}");
                         const windowId = String(binding.stdout || "").trim();
-                        if (binding.returnCode === 0 && /^\$\d+$/.test(windowId)) {
+                        if (binding.returnCode === 0 && isRmuxWindowId(windowId)) {
                             const binding = { windowId, sessionPath: sessFile, ownerToken: crypto.randomUUID() };
                             await registerWindowBinding((...args: string[]) => rmux.cmd(...args), binding);
                             (globalThis as any).__pi_subagent_window_binding_v3__ = binding;

@@ -29,6 +29,11 @@
 - **Bilingual documentation:** complete English and Simplified Chinese READMEs document installation, tools/commands, upgrade/bootstrap steps, shared state directories, identity requirements, lease boundaries and verification limits.
   **双语文档：** 完整英文和简体中文 README 说明安装、工具/命令、升级/bootstrap 步骤、共享状态目录、身份要求、lease 边界及验证限制。
 
+### RMUX window-ID protocol correction / RMUX 窗口 ID 协议修正
+
+- RMUX 0.9.1 uses `@digits` window IDs, `%digits` pane IDs and `$digits` session IDs. Fresh `dead-window-v5.mjs` / `window-binding-v4.mjs` and all runtime launch/binding/stop ID gates accept only `@` windows, rejecting `$` session selectors. Earlier v3/v4 modules remain unchanged for cached legacy consumers. Correct actual-format fixtures cover missing-launch-ID parking without inferred adoption; activation remains deferred.
+  RMUX 0.9.1 使用 `@数字` window ID、`%数字` pane ID、`$数字` session ID。新版本化清理/绑定模块及 runtime 启动捕获、绑定、stop 门禁只接受 `@` 窗口，拒绝 `$` session selector。旧 v3/v4 模块保持不变；实际格式 fixture 验证历史缺失 ID 仍可安全 parked，不推断领用身份，暂不激活。
+
 ### Maintenance cleanup fix / 维护清理修复
 
 Activation is deferred; verified with isolated fixtures, not a live-deployment claim.

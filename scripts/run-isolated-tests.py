@@ -4,7 +4,9 @@ import argparse, json, os, pathlib, shutil, subprocess, tempfile
 REPO=pathlib.Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output',type=pathlib.Path,default=REPO/'artifacts/diagnostics/durable_ghost_20261007/isolated_fix_test_results.json')
-OUT=parser.parse_args().output.resolve()
+parser.add_argument('--test',action='append',help='Run only these named test files serially; omit the full-check stage when focused.')
+args=parser.parse_args()
+OUT=args.output.resolve()
 # Use an already-installed compiler. No dependency installation/modification.
 compiler=next((p for p in [REPO/'node_modules/esbuild/bin/esbuild', REPO.parent/'pi-agent-notify/node_modules/esbuild/bin/esbuild'] if p.exists()),None)
 if not compiler: raise SystemExit('local esbuild required')
@@ -26,8 +28,14 @@ with tempfile.TemporaryDirectory(prefix='durable-fix-isolated-') as td:
                PI_AGENT_NOTIFY_DIR=str(root/'notify'),PI_AGENT_NOTIFY_STATE_DIR=str(root/'notify-state'),
                npm_config_offline='true',npm_config_cache=str(root/'npm-cache'),PI_SUBAGENT_TEST_BUILD_DIR=str(root/'bundle'))
     commands=[('bundle',[str(compiler),'extensions/index.ts','extensions/context-inherit.ts','--bundle','--platform=node','--format=esm','--external:@earendil-works/*','--external:@rmux/*','--external:typebox','--outdir='+str(root/'bundle')])]
-    commands += [(test.name,[shutil.which('node'),str(test)]) for test in sorted((dest/'tests').glob('*.test.mjs'))]
-    commands.append(('full-check',[shutil.which('npm'),'run','check']))
+    tests=sorted((dest/'tests').glob('*.test.mjs'))
+    if args.test:
+        selected=set(args.test)
+        unknown=selected-{test.name for test in tests}
+        if unknown: raise SystemExit('unknown focused tests: '+', '.join(sorted(unknown)))
+        tests=[test for test in tests if test.name in selected]
+    commands += [(test.name,[shutil.which('node'),str(test)]) for test in tests]
+    if not args.test: commands.append(('full-check',[shutil.which('npm'),'run','check']))
     for name,command in commands:
         try:
             r=subprocess.run(command,cwd=dest,env=env,capture_output=True,text=True,timeout=180 if name=='full-check' else 60)

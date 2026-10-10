@@ -32,8 +32,8 @@ globalThis.__fixtureRmux = { cmd: async (...args) => {
   if (args[0] === "if-shell") { if (cleanupFail) return {returnCode: 1}; removed = true; return {returnCode:0}; }
   if (args[0] === "kill-window") { if (state === "kill-fail") return {returnCode:1}; removed=true;return {returnCode:0}; }
   assert.equal(args[0], "list-panes", "recovery must not restart panes");
-  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0, stdout:`${target}|$42`};
-  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}|#{pane_id}|#{pane_dead}")) return {returnCode:0, stdout: removed ? "" : `${target}|$42|%7|${state === "dead" ? 1 : 0}`};
+  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0, stdout:`${target}|@42`};
+  if (args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}|#{pane_id}|#{pane_dead}")) return {returnCode:0, stdout: removed ? "" : `${target}|@42|%7|${state === "dead" ? 1 : 0}`};
   if (state === "unknown") return { returnCode: 1, stderr: "fixture connection failure" };
   return { returnCode: 0, stdout: args.includes("#{session_name}|#{window_name}|#{pane_dead}")
     ? `pi-agents|fixture-${taskId}|${state === "dead" ? 1 : 0}`
@@ -205,7 +205,7 @@ try {
   globalThis.__fixtureRmux={cmd:async(...args)=>{
     if(args[0]==="kill-window") { if (state !== "kill-fail") stopGone = true; return {returnCode:state==="kill-fail"?1:0}; }
     if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}")) return { returnCode: 0, stdout: stopGone ? "" : `${stopTarget}|0` };
-    if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0,stdout:`${stopTarget}|$90`};
+    if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{window_id}")) return {returnCode:0,stdout:`${stopTarget}|@90`};
     const r=await originalRmux.cmd(...args); if(args.includes("#{session_name}:#{window_name}.#{pane_index}|#{pane_dead}|#{pane_dead_status}")) r.stdout+=`\n${stopTarget}|0|`; return r;
   }};
   state="live"; await commands.get("agent:recover").handler("",ctx);
