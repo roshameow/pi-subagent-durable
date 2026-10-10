@@ -53,7 +53,7 @@ import {
 } from "./safety.mjs";
 import { resolveDispatchConfig } from "./dispatch.mjs";
 import { findRealSessionPathInRoot, resolveResumeTarget } from "./session-resume.mjs";
-import { RecoveryController, probeRmuxTask, readTaskRecords, parseRecoveryResult, atomicRecoveryWrite, taskRecordPath } from "./recovery-v3.mjs";
+import { RecoveryController, probeRmuxTask, readTaskRecords, parseRecoveryResult, atomicRecoveryWrite, taskRecordPath } from "./recovery-v4.mjs";
 import { prepareUpgrade, publishUpgradeManifest } from "./upgrade-handoff-v2.mjs";
 import { selectListedTasks } from "./list-scope.mjs";
 import { runRmuxSync } from "./rmux-sync-client-v3.mjs";
@@ -61,7 +61,7 @@ import { RmuxCommandScope } from "./rmux-command-v3.mjs";
 import { currentRunSettled, lifecyclePolicy, MonitorScope } from "./lifecycle-v3.mjs";
 import { registerWindowBinding, clearWindowBinding } from "./window-binding-v3.mjs";
 import { workerPipelineCommand } from "./worker-pipeline-v3.mjs";
-import { cleanupDeadWindow } from "./dead-window-v3.mjs";
+import { cleanupDeadWindow, cleanupDeadWindowResult } from "./dead-window-v4.mjs";
 import { startReceiverKeeper } from "./receiver-keeper.mjs";
 
 // ── RMUX integration ──
@@ -1579,12 +1579,26 @@ function signalFallbackProcesses(taskIds?: Set<string>): number {
 
 async function cleanupDeadRmuxWindows(dryRun = false): Promise<{ found: number; removed: number }> {
  const panes = listRmuxTaskPanes();
+ const durableRecords = readTaskRecords(path.join(getAgentDir(), "durable-tasks"));
  const deadWindows = [...new Set(panes.map(p => p.windowName))].filter(name => panes.filter(p => p.windowName === name).every(p => p.dead));
- if (dryRun || deadWindows.length === 0) return { found: deadWindows.length, removed: 0 };
- const results = await mapWithConcurrencyLimit(deadWindows, MAX_CONCURRENCY, async windowName => {
-  const taskId = panes.find(p => p.windowName === windowName)!.taskId;
-  const durable = readTaskRecords(path.join(getAgentDir(), "durable-tasks")).find((r: any) => r.taskId === taskId);
+ const candidates = new Map(deadWindows.map(windowName => [panes.find(p => p.windowName === windowName)!.taskId, windowName]));
+ // Include current-parent parked tasks even when their retained window has since
+ // vanished. The fenced cleanup query, NOT this discovery snapshot, proves
+ // absence. Live/mixed discovery rows remain ineligible. No identity repair.
+ for (const record of durableRecords) {
+  if (record.cleanupState !== "blocked_manual" || record.parentSessionId !== currentSessionId) continue;
+  const matching = panes.filter(p => p.taskId === record.taskId);
+  if (matching.every(p => p.dead)) candidates.set(record.taskId, matching[0]?.windowName || "");
+ }
+ if (dryRun || candidates.size === 0) return { found: candidates.size, removed: 0 };
+ // One controller tick owns manual retry at a time; do not race parked claims.
+ const results = await mapWithConcurrencyLimit([...candidates], 1, async ([taskId, windowName]) => {
+  const durable = durableRecords.find((r: any) => r.taskId === taskId);
   try {
+   if (durable?.cleanupState === "blocked_manual") {
+    if (durable.parentSessionId !== currentSessionId || !upgradeController) return false;
+    return await upgradeController.retryCleanup(taskId);
+   }
    const rmux = await getRmux(); if (!rmux) return false;
    const record = durable || { taskId, rmuxTarget: `${RMUX_SESSION_NAME}:${windowName}.0` };
    const fence = () => { if (durable) { if (durable.parentSessionId !== currentSessionId || !upgradeController) throw new Error("foreign/uncontrolled GC task"); upgradeController.fence(taskId); } };
@@ -1593,7 +1607,7 @@ async function cleanupDeadRmuxWindows(dryRun = false): Promise<{ found: number; 
   } catch { return false; }
  });
  _extCache = null;
- return { found: deadWindows.length, removed: results.filter(Boolean).length };
+ return { found: candidates.size, removed: results.filter(Boolean).length };
 }
 
 async function emergencyStopAll(running: { taskId: string; entry: AsyncTaskEntry }[]): Promise<string> {
@@ -2065,7 +2079,7 @@ export default function (pi: ExtensionAPI) {
 			probe: async (record: any, options: { signal?: AbortSignal }) => { const rmux = await getRmux(options); return rmux ? probeRmuxTask((...args: string[]) => rmux.cmd(...args), record) : { state: "unknown", reason: "RMUX unavailable" }; },
             cleanup: async (record: any, fence: () => void, guard: any) => {
                 const rmux = await getRmux(); if (!rmux) throw new Error("RMUX unavailable for cleanup");
-                return cleanupDeadWindow((...args: string[]) => rmux.cmd(...args), record, fence, guard, () => guard(() => atomicRecoveryWrite(taskRecordPath(ledgerDir(), record.taskId), record)));
+                return cleanupDeadWindowResult((...args: string[]) => rmux.cmd(...args), record, fence, guard, () => guard(() => atomicRecoveryWrite(taskRecordPath(ledgerDir(), record.taskId), record)));
             },
 			isAcknowledged: acknowledged,
 			skipExistingCallback: (record: any) => { const entry = asyncTasks.get(record.taskId); return Boolean(entry && !entry.recoveryManaged); },
@@ -3430,13 +3444,13 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent GC",
 		description: "Find or remove completed rmux panes retained by durable subagents. Only pane_dead=1 windows are eligible; live workers are never touched.",
 		parameters: Type.Object({
-			dryRun: Type.Optional(Type.Boolean({ description: "Only count dead panes without removing them. Default: false.", default: false })),
+			dryRun: Type.Optional(Type.Boolean({ description: "Only count dead-window/parked cleanup candidates without changing them. Default: false.", default: false })),
 		}),
 		async execute(_toolCallId, params) {
 			const result = await cleanupDeadRmuxWindows(params.dryRun ?? false);
 			return { content: [{ type: "text", text: params.dryRun
-				? `${result.found} dead subagent pane(s) found; nothing removed.`
-				: `${result.removed}/${result.found} dead subagent pane(s) removed; live workers untouched.` }] };
+				? `${result.found} dead-window/parked cleanup candidate(s) found; nothing changed.`
+				: `${result.removed}/${result.found} dead-window/parked cleanup candidate(s) cleaned; live workers untouched.` }] };
 		},
 	});
 
@@ -3444,7 +3458,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Remove completed/dead durable subagent rmux panes without touching live workers",
 		handler: async (_args, ctx) => {
 			const result = await cleanupDeadRmuxWindows(false);
-			ctx.ui.notify(`${result.removed}/${result.found} dead subagent pane(s) removed; live workers untouched.`, "info");
+			ctx.ui.notify(`${result.removed}/${result.found} dead-window/parked cleanup candidate(s) cleaned; live workers untouched.`, "info");
 		},
 	});
 

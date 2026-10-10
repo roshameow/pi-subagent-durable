@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Private source/state snapshots; never run npm check against live user state."""
-import json, os, pathlib, shutil, subprocess, tempfile
+import argparse, json, os, pathlib, shutil, subprocess, tempfile
 REPO=pathlib.Path(__file__).resolve().parents[1]
-OUT=REPO/'artifacts/diagnostics/durable_ghost_20261007/isolated_fix_test_results.json'
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--output',type=pathlib.Path,default=REPO/'artifacts/diagnostics/durable_ghost_20261007/isolated_fix_test_results.json')
+OUT=parser.parse_args().output.resolve()
 # Use an already-installed compiler. No dependency installation/modification.
 compiler=next((p for p in [REPO/'node_modules/esbuild/bin/esbuild', REPO.parent/'pi-agent-notify/node_modules/esbuild/bin/esbuild'] if p.exists()),None)
 if not compiler: raise SystemExit('local esbuild required')

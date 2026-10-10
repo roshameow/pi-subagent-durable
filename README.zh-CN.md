@@ -128,6 +128,13 @@ Controller 心跳独立于 RMUX 探测执行。若当前 controller 的已认证
 
 新版 recovery 在结果 outbox fsync 持久化后，独立于 transcript ACK 自动删除自己的 dead window。必须核验精确 task target、稳定 window/pane ID、第二次全 pane 快照与 daemon 端 dead 条件；任何 live pane、改名/替换、查询失败均不无条件删除。失败持久化 `cleanup_pending`，即便已有 `deliveredAt` 仍会恢复重试。Ownership 退役另存 `retirement_pending`，ACK 后仍会重试，但不重放已确认结果。定向 stop 只有成功 kill 才清 registry、task、monitor 与 cache；kill 失败保留原状态。Canonical、日志与结果不删除。条件命令不兼容时 fail closed。
 
+**清理停放（暂不激活）：** 新入口 `recovery-v4.mjs` 与 `dead-window-v4.mjs` 隔离已运行主代理缓存的原生 ESM namespace。仓库实现已通过隔离 fixture 验证；不表示已部署，也不要求现在 reload。
+
+- 永久清理结果 `missing_launch_identity` 仅来自权威快照：精确目标的**全部 pane 均已死亡**。查询失败/unknown、混合 live/dead 或目标不明确均不能据此分类；绝不推断缺失的 launch window/pane ID。
+- 对该永久失败，仅 `status: completed`、存在 result、`deliveredAt` 已持久化且 `retirementState: retired` 时，才可持久化 `cleanupState: blocked_manual` 及原因，**随后**释放 maintenance lease。停放保留结果、canonical 会话、日志和 pane，不等于清理成功。冷启动报告 parked 而非 cleaned，不重新获取已释放的 parked lease。
+- 持久化或 lease 释放失败均保留安全重试；停放保存成功前不得释放 lease。暂时性清理失败使用内存中的 **30 至 300 秒**退避，不在每次重试时保存未变记录。待 ACK 或待退役仍阻止停放。
+- 显式 `/agent:gc` 或 `subagent_gc` 在 fenced lease 下重试**当前主会话**匹配的 parked 任务（dry-run 仍只读）。清理仍须 launch identity 已被独立、正确恢复，或有权威证据证明目标不存在；GC 不推断身份，不强制发信号。活跃 worker/wait、transcript ACK 屏障及 registry 锁/fsync 保证不变。
+
 Pi >=0.99 与未知/custom host 要求当前 run 的 `agent_settled`；历史 settled 或 `agent_end`（含待 retry）不算成功。经核验的 pre-0.99 CLI 显式记录 `legacy-end` 兼容策略，只接受当前最后一次非重试 end，不从“没见到 settled”自动降级。另记 worker 真实退出码，不误用 filter 的 exit0。
 
 RMUX 命令有真实 signal/timeout、私有进程组取消与 pipe 清理；同步发现由有界私有 supervisor 执行（`-N` 不启动 daemon）。退出/切换会话清自己的 monitor 与 timers；reload 保留 legacy monitor、转交新命令 scope，并 fenced 重建 recovery monitor，不停止 live worker。已运行旧代码的未跟踪 SDK 子进程/timer 不能靠新代码追溯清理，受控父代理冷重启是更强边界。

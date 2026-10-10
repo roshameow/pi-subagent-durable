@@ -11,7 +11,8 @@ import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { test } from "node:test";
-import * as v2 from "../extensions/recovery-v3.mjs";
+import * as v2 from "../extensions/recovery-v4.mjs";
+import * as legacy from "../extensions/recovery-v3.mjs";
 import * as shim from "../extensions/recovery.mjs";
 import {
   acquireControllerLease, releaseControllerLease, assertControllerLease,
@@ -20,7 +21,7 @@ import {
 
 const baseTime = 1700000000000;
 const leaseUrl = new URL("../extensions/controller-lease.mjs", import.meta.url).href;
-const recoveryUrl = new URL("../extensions/recovery-v3.mjs", import.meta.url).href;
+const recoveryUrl = new URL("../extensions/recovery-v4.mjs", import.meta.url).href;
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 function fixture(t, overrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-recovery-expiry-"));
@@ -62,10 +63,10 @@ function successor(f, r, overrides = {}) {
   });
 }
 
-test("compatibility exports and direct v3 import bypass a cached old class (isolated Node)", t => {
+test("legacy compatibility exports and direct v4 import bypass a cached old class (isolated Node)", t => {
   const f = fixture(t);
-  assert.deepEqual(Object.keys(shim), Object.keys(v2));
-  for (const key of Object.keys(v2)) assert.equal(shim[key], v2[key]);
+  assert.deepEqual(Object.keys(shim), Object.keys(legacy));
+  for (const key of Object.keys(legacy)) assert.equal(shim[key], legacy[key]);
   const cachedPath = path.join(f.dir, "old-recovery.mjs");
   const oldUrl = pathToFileURL(cachedPath).href;
   const output = execFileSync(process.execPath, ["--input-type=module", "-e", `

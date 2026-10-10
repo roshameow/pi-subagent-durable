@@ -89,8 +89,8 @@ try {
   // Keep the real controller implementation; adapter hooks expose constructor /
   // recovery boundaries and allow a dependency failure, not a lifecycle rewrite.
   const mockRecovery = path.join(root, "recovery-adapter.mjs");
-  fs.writeFileSync(mockRecovery, `export * from ${JSON.stringify(path.resolve("extensions/recovery.mjs"))};
-    import {RecoveryController as RealController} from ${JSON.stringify(path.resolve("extensions/recovery.mjs"))};
+  fs.writeFileSync(mockRecovery, `export * from ${JSON.stringify(path.resolve("extensions/recovery-v4.mjs"))};
+    import {RecoveryController as RealController} from ${JSON.stringify(path.resolve("extensions/recovery-v4.mjs"))};
     export class RecoveryController extends RealController {
       constructor(options){globalThis.__fixtureRecoveryStage?.('constructor');super(options);globalThis.__fixtureControllerOptions=options;this.firstRecovery=true}
       async recover(){if(this.firstRecovery){this.firstRecovery=false;globalThis.__fixtureRecoveryStage?.('recover')}return super.recover()}
@@ -103,7 +103,7 @@ try {
       return realUnregister(...args);
     }`);
   let bundledSource = replacePeers(source);
-  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : name === "ownership-registry-v3.mjs" ? mockRegistry : (name === "recovery.mjs" || name === "recovery-v2.mjs" || name === "recovery-v3.mjs") ? mockRecovery : path.resolve("extensions", name)));
+  bundledSource = bundledSource.replace(/"\.\/([^"\n]+)"/g, (_match, name) => JSON.stringify(name === "agents.ts" ? mockAgents : name === "ownership-registry-v3.mjs" ? mockRegistry : (name === "recovery.mjs" || name === "recovery-v2.mjs" || name === "recovery-v3.mjs" || name === "recovery-v4.mjs") ? mockRecovery : path.resolve("extensions", name)));
   const input = path.join(root, "index.ts"); fs.writeFileSync(input, bundledSource);
   execFileSync("npx", ["--no-install", "esbuild", input, "--bundle", "--platform=node", "--format=esm", `--outfile=${file}`], { stdio: "pipe" });
   const extension = await import(pathToFileURL(file));
@@ -251,6 +251,24 @@ try {
   assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===taskId).cleanupState,"cleaned");
   assert.equal(removed,true); assert.ok(fs.existsSync(logPath)); assert.ok(fs.existsSync(parentPath));
   assert.ok(entries.some(e=>e.customType==="agent-delivery"));
+  // Real GC entry points explicitly reclaim parked current-parent tasks, even
+  // when discovery omits a retained/absent window. They never repair launch ID.
+  const parkedRecord={...completedRecord,retirementState:"retired",cleanupState:"blocked_manual",requireRmuxIdentity:true,
+    cleanupBlockCode:"missing_launch_identity",cleanupBlockReason:"launch window identity unavailable; refusing inferred replacement"};
+  delete parkedRecord.rmuxWindowId;
+  atomicRecoveryWrite(taskRecordPath(path.join(root,"durable-tasks"),taskId),parkedRecord);
+  const gc=tools.get("subagent_gc"),controllerBeforeGC=fs.readFileSync(path.join(root,"durable-tasks",".controllers.json"),"utf8");
+  await gc.execute("gc-dry",{dryRun:true});
+  assert.equal(fs.readFileSync(path.join(root,"durable-tasks",".controllers.json"),"utf8"),controllerBeforeGC,"dry-run does not claim parked authority");
+  removed=false;await gc.execute("gc-explicit",{dryRun:false});
+  assert.equal(removed,false,"manual GC never infers missing launch identity to kill a dead pane");
+  assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===taskId).cleanupState,"blocked_manual");
+  const foreignParked={...parkedRecord,taskId:"task-parked-foreign",parentSessionId:"foreign-parent"};
+  atomicRecoveryWrite(taskRecordPath(path.join(root,"durable-tasks"),foreignParked.taskId),foreignParked);
+  const foreignBefore=fs.readFileSync(taskRecordPath(path.join(root,"durable-tasks"),foreignParked.taskId),"utf8");
+  removed=true;await commands.get("agent:gc").handler("",ctx);
+  assert.equal(readTaskRecords(path.join(root,"durable-tasks"),parentId).find(r=>r.taskId===taskId).cleanupState,"cleaned","authoritative absence cleans a parked obligation");
+  assert.equal(fs.readFileSync(taskRecordPath(path.join(root,"durable-tasks"),foreignParked.taskId),"utf8"),foreignBefore,"GC does not reclaim foreign parked tasks");
   await commands.get("agent-results").handler("",ctx); assert.match(notices.at(-1),/fixture/);
   // prepare refuses before starting the detached keeper or changing reservations.
   await commands.get("agent:prepare-upgrade").handler("",{...ctx,isIdle:()=>false}); assert.match(notices.at(-1),/busy/);

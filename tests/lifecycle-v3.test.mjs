@@ -20,6 +20,6 @@ assert.equal(currentRunSettled(raw(["agent_start","agent_end"]),"legacy-end"),tr
 assert.equal(currentRunSettled(raw(["agent_start",{type:"agent_end",willRetry:true}]),"legacy-end"),false);
 assert.equal(currentRunSettled(raw(["agent_end","agent_start"]),"legacy-end"),false);
 const source=fs.readFileSync("extensions/index.ts","utf8");
-assert.doesNotMatch(source,/--mcp-config/); assert.match(source,/recovery-v3\.mjs/);
+assert.doesNotMatch(source,/--mcp-config/); assert.match(source,/recovery-v4\.mjs/);
 assert.doesNotMatch(source,/rmuxClient\.close|connectOrStart/);
 console.log("OK: explicit lifecycle capability; current-run settlement, retry and old-version compatibility; MCP neutral launch");

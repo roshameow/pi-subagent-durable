@@ -29,6 +29,20 @@
 - **Bilingual documentation:** complete English and Simplified Chinese READMEs document installation, tools/commands, upgrade/bootstrap steps, shared state directories, identity requirements, lease boundaries and verification limits.
   **双语文档：** 完整英文和简体中文 README 说明安装、工具/命令、升级/bootstrap 步骤、共享状态目录、身份要求、lease 边界及验证限制。
 
+### Maintenance cleanup fix / 维护清理修复
+
+Activation is deferred; verified with isolated fixtures, not a live-deployment claim.
+暂不激活；已通过隔离 fixture 验证，不代表 live 部署。
+
+- **Cache-safe v4 entry points:** new `recovery-v4.mjs` and `dead-window-v4.mjs` avoid old native ESM namespaces during later activation. Permanent `missing_launch_identity` requires an authoritative exact all-dead snapshot; missing launch IDs are never inferred.
+  **缓存安全的 v4 入口：** 新 `recovery-v4.mjs`、`dead-window-v4.mjs` 为后续激活避开旧原生 ESM namespace。永久 `missing_launch_identity` 仅来自权威、精确、全 dead 快照，绝不推断缺失 launch ID。
+
+- **Durable manual parking:** for that permanent failure, only `status: completed` + result + durable `deliveredAt` + `retirementState: retired` may save `cleanupState: blocked_manual` with its reason before releasing the maintenance lease. Preserve result/session/log/pane; cold startup reports parked, not cleaned, without reacquiring released parked leases. Failed saves/releases remain safely retryable; transient cleanup retries back off in memory from 30 to 300 seconds, without unchanged saves.
+  **持久化人工停放：** 对该永久失败，仅 `status: completed` + result + 已持久化 `deliveredAt` + `retirementState: retired` 可先保存 `cleanupState: blocked_manual` 及原因，再释放 maintenance lease。保留结果/会话/日志/pane；冷启动报告 parked 而非 cleaned，不重获已释放的 parked lease。保存/释放失败可安全重试；暂时性清理失败在内存中按 30 至 300 秒退避，不保存未变记录。
+
+- **Explicit fenced GC retry:** `/agent:gc` and `subagent_gc` retry matching current-parent parked tasks; dry-run stays read-only. Require independently, correctly restored identity or authoritative absence proof, never identity inference or forced signals. Active workers/waits, ACK barriers and registry lock/fsync guarantees remain unchanged.
+  **显式 fenced GC 重试：** `/agent:gc` 与 `subagent_gc` 重试当前主会话匹配的 parked 任务，dry-run 仍只读。须身份已独立、正确恢复或有权威不存在证据，不推断身份、不强制发信号。活跃 worker/wait、ACK 屏障及 registry 锁/fsync 保证不变。
+
 ### Fixed / 修复
 
 - **Stopped ghosts after hot reload:** versioned terminal/registry reconciliation requires matching canonical parent/token, fresh successful pane/process absence and no fresh receiver/active wait before unregistering a locally held legacy task. Replaces old ownership heartbeat closures; blocks legacy terminal revival while retaining identity-based receiver pruning/renewal, preserves ambiguous/foreign/live tasks and pending delivery receipts, and retries confirmed-stop registry cleanup without signals or history deletion. Prior successful unregister with failed global cleanup is recognized as `already_absent` under the registry lock, using the same safety gates and no metadata/other-row writes. Added main-PID ghost, conservative-preservation, timer replacement and partial-cleanup regressions; the isolated runner now also executes the full check in private state.
